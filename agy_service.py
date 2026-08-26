@@ -124,7 +124,7 @@ def validate_ledger():
             del canonical_record_for_sig["signature_ed25519"]
             
             with open(PUB_KEY_PATH, "rb") as f:
-                pub_key = serialization.load_pem_public_key(f.read(), password=None)
+                pub_key = serialization.load_pem_public_key(f.read())
                 
             pub_key.verify(
                 sig_bytes,
