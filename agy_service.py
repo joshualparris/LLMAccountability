@@ -238,8 +238,25 @@ def certify(req: ClaimRequest):
             status = "PASS"
 
         elif req.claim == "tests-pass":
-            if ev.get("exit_code") != 0:
-                raise ValueError(f"Tests failed with exit code {ev.get('exit_code')}")
+            exit_code = ev.get("exit_code")
+            if exit_code != 0:
+                raise ValueError(f"Tests failed with exit code {exit_code}")
+                
+            collected = ev.get("tests")
+            passed = ev.get("passed")
+            failures = ev.get("failures")
+            errors = ev.get("errors")
+            skipped = ev.get("skipped")
+            
+            # If structured metrics are present, validate them
+            if collected is not None and failures is not None and passed is not None and skipped is not None:
+                if failures > 0 or (errors is not None and errors > 0):
+                    raise ValueError(f"Inconsistent evidence: exit_code is 0 but there are failures ({failures}) or errors ({errors})")
+                if collected < 0 or passed < 0 or failures < 0 or skipped < 0:
+                    raise ValueError("Inconsistent evidence: negative test metric counts")
+                if passed + failures + skipped > collected:
+                    raise ValueError("Inconsistent evidence: passed + failures + skipped > collected")
+                    
             status = "PASS"
 
         elif req.claim == "running":
