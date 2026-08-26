@@ -9,7 +9,7 @@ import hashlib
 from datetime import datetime, timezone
 import uuid
 
-AUDIT_LOG_FILE = os.path.abspath(os.environ.get("AGY_AUDIT_LOG", "agy_verification_audit.jsonl"))
+AUDIT_LOG_FILE = os.path.abspath("agy_verification_audit.jsonl")
 
 def get_last_hash() -> str:
     if not os.path.exists(AUDIT_LOG_FILE):
@@ -43,22 +43,36 @@ def validate_ledger():
             
         expected_hash = record.get("hash")
         
+        if record.get("previous_hash") != prev_hash:
+            print(f"VERIFICATION FAILED: previous_hash mismatch at line {i+1}", file=sys.stderr)
+            sys.exit(1)
+            
         temp_record = {
             "timestamp": record["timestamp"],
             "claim": record["claim"],
             "status": record["status"],
-            "evidence": record["evidence"]
+            "evidence": record["evidence"],
+            "previous_hash": prev_hash
         }
         if "error" in record:
             temp_record["error"] = record["error"]
             
-        temp_record["previous_hash"] = prev_hash
-        
         canonical_json = json.dumps(temp_record, sort_keys=True)
         calculated_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
         
         if calculated_hash != expected_hash:
             print(f"VERIFICATION FAILED: Ledger tampered or corrupted at line {i+1}!", file=sys.stderr)
+            sys.exit(1)
+            
+        # Parse timestamp safely to reconstruct the expected certificate ID
+        try:
+            ts = datetime.fromisoformat(record["timestamp"])
+            expected_cert_id = f"AGY-{ts.strftime('%Y%m%d')}-{calculated_hash[:8]}"
+            if record.get("certificate_id") != expected_cert_id:
+                print(f"VERIFICATION FAILED: certificate_id mismatch at line {i+1}", file=sys.stderr)
+                sys.exit(1)
+        except ValueError:
+            print(f"VERIFICATION FAILED: Invalid timestamp format at line {i+1}", file=sys.stderr)
             sys.exit(1)
             
         prev_hash = expected_hash
@@ -180,6 +194,10 @@ def main():
             elif claim == "tests-pass":
                 if not args.test_command:
                     raise ValueError("Missing --test-command")
+                
+                allowed_prefixes = ["pytest", "npm test", "cargo test", "go test", "make test"]
+                if not any(args.test_command.startswith(prefix) for prefix in allowed_prefixes):
+                    raise ValueError(f"Invalid test command. Must start with one of: {', '.join(allowed_prefixes)}")
                 
                 evidence["command"] = args.test_command
                 evidence["repo_path"] = os.path.abspath(args.repo_path)

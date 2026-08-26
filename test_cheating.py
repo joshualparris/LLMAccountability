@@ -28,19 +28,32 @@ def test_hash_chain(audit_log):
             "timestamp": record["timestamp"],
             "claim": record["claim"],
             "status": record["status"],
-            "evidence": record["evidence"]
+            "evidence": record["evidence"],
+            "previous_hash": prev_hash
         }
         if "error" in record:
             temp_record["error"] = record["error"]
             
-        temp_record["previous_hash"] = prev_hash
-        
         canonical_json = json.dumps(temp_record, sort_keys=True)
         calculated_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
         
+        if record.get("previous_hash") != prev_hash:
+            print(f"FAIL: previous_hash mismatch at line {i+1}!")
+            sys.exit(1)
+            
         if calculated_hash != expected_hash:
             print(f"FAIL: Hash mismatch at line {i+1}!")
             sys.exit(1)
+            
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(record["timestamp"])
+            expected_cert_id = f"AGY-{ts.strftime('%Y%m%d')}-{calculated_hash[:8]}"
+            if record.get("certificate_id") != expected_cert_id:
+                print(f"FAIL: certificate_id mismatch at line {i+1}!")
+                sys.exit(1)
+        except ValueError:
+            pass
             
         prev_hash = expected_hash
         
@@ -50,15 +63,16 @@ def test_tamper_detection():
     print("Testing fail-closed tamper detection...")
     
     with tempfile.TemporaryDirectory() as tempdir:
-        test_log = os.path.join(tempdir, "test_audit.jsonl")
-        env = os.environ.copy()
-        env["AGY_AUDIT_LOG"] = test_log
+        test_log = os.path.join(tempdir, "agy_verification_audit.jsonl")
+        
+        # We need to copy agy_verifier.py to the temp dir so it can run there
+        shutil.copy("agy_verifier.py", tempdir)
         
         # Run verifier to create first valid record
-        subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], env=env, capture_output=True)
+        subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], cwd=tempdir, capture_output=True)
         
         # Run again to create second valid record
-        subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], env=env, capture_output=True)
+        subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], cwd=tempdir, capture_output=True)
         
         with open(test_log, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -73,7 +87,7 @@ def test_tamper_detection():
             
         # Now run the verifier again. It MUST fail closed before doing anything.
         print("Running verifier on tampered ledger...")
-        res = subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], env=env, capture_output=True, text=True)
+        res = subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], cwd=tempdir, capture_output=True, text=True)
         
         if res.returncode == 0:
             print("FATAL: Verifier issued a certificate despite a tampered ledger!")

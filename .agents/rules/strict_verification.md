@@ -15,7 +15,7 @@ Whenever you want to assert one of the following states, you MUST run the `agy_v
 
 ### Supported Claims and Required Evidence
 - **Code pushed**: Run `python agy_verifier.py certify --claim pushed`
-- **Tests pass**: Run `python agy_verifier.py certify --claim tests-pass --test-command "<your command>"`
+- **Tests pass**: Run `python agy_verifier.py certify --claim tests-pass --test-command "<your command>"`. *Note: The command must be a standard test runner (pytest, npm test, cargo test, go test, make test).*
 - **Process running**: Run `python agy_verifier.py certify --claim running --pid <PID> --expected-bin-hash <SHA256>`
 - **Endpoint working**: Run `python agy_verifier.py certify --claim endpoint-working --url <URL> --expected-status 200 --expected-content "<substring>"`
 
