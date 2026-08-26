@@ -3,9 +3,9 @@
 The framework has been completely rewritten into an independent Certification Authority to physically prevent Antigravity from confabulating success.
 
 ## What was built
-1. **The Certification Authority CLI (`agy_verifier.py`)**: A Python script using standard `argparse` that acts as the sole source of observed evidence. It accepts claims and validates them structurally.
-2. **The Enforcement Rule (`strict_verification.md`)**: An `always_on` Antigravity rule instructing the model that it is structurally forbidden from claiming success without obtaining a Certificate ID from the CLI first.
-3. **Audit Trail**: Every certification attempt is recorded in `agy_verification_audit.jsonl`.
+1. **The Certification Authority CLI (`agy_verifier.py`)**: A Python script using standard `argparse` that acts as the sole source of observed evidence. It accepts claims and validates them structurally. To prevent covert modification, it hashes its own source code and includes `verifier_hash` in the certificate.
+2. **The Enforcement Rule (`strict_verification.md`)**: An `always_on` Antigravity rule instructing the model that it is strictly forbidden from claiming success without obtaining a Certificate ID from the CLI first.
+3. **Hash-Chained Audit Trail**: Every certification attempt is recorded in `agy_verification_audit.jsonl`. Each record calculates a SHA-256 hash of its own contents combined with the hash of the previous record, making the log cryptographically tamper-evident.
 
 ## How it works
 Rather than simply checking assertions, the agent must ask the verifier to "certify" a claim. The verifier dictates the evidence required.

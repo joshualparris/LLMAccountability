@@ -11,15 +11,34 @@ import uuid
 
 AUDIT_LOG_FILE = os.path.abspath("agy_verification_audit.jsonl")
 
+def get_last_hash() -> str:
+    if not os.path.exists(AUDIT_LOG_FILE):
+        return "0" * 64
+    try:
+        with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            if not lines:
+                return "0" * 64
+            last_record = json.loads(lines[-1])
+            return last_record.get("hash", "0" * 64)
+    except Exception:
+        return "0" * 64
+
 def append_audit_log(record: dict):
     with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
+def get_self_hash() -> str:
+    hasher = hashlib.sha256()
+    with open(os.path.abspath(__file__), 'rb') as f:
+        hasher.update(f.read())
+    return hasher.hexdigest()
+
 def generate_certificate(claim: str, status: str, evidence: dict, error: str = None) -> dict:
-    cert_id = f"AGY-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid.uuid4())[:8]}"
+    evidence["verifier_hash"] = get_self_hash()
+    
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "certificate_id": cert_id,
         "claim": claim,
         "status": status,
         "evidence": evidence,
@@ -27,6 +46,16 @@ def generate_certificate(claim: str, status: str, evidence: dict, error: str = N
     if error:
         record["error"] = error
         
+    prev_hash = get_last_hash()
+    record["previous_hash"] = prev_hash
+    
+    canonical_json = json.dumps(record, sort_keys=True)
+    new_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
+    
+    record["hash"] = new_hash
+    cert_id = f"AGY-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{new_hash[:8]}"
+    record["certificate_id"] = cert_id
+    
     append_audit_log(record)
     return record
 
