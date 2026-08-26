@@ -198,3 +198,14 @@ def test_valid_evidence_produces_signed_receipt_that_verifies(monkeypatch):
         
     # verify() will raise InvalidSignature if it fails
     pub_key.verify(sig_bytes, pae_bytes)
+
+def test_installer_syntax_validity():
+    import subprocess
+    import os
+    
+    script_path = os.path.abspath("install_service.ps1")
+    # This command uses the PowerShell AST to parse the script and returns success if valid.
+    cmd = ["powershell", "-NoProfile", "-Command", f"$null = [scriptblock]::Create((Get-Content '{script_path}' -Raw))"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    assert result.returncode == 0, f"Installer syntax error: {result.stderr}"

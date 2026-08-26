@@ -47,8 +47,10 @@ $WorkerRead = New-Object System.Security.AccessControl.FileSystemAccessRule($Wor
 $DirAcl = Get-Acl $ProtectedDir
 $DirAcl.SetAccessRuleProtection($true, $false)
 foreach ($rule in $DirAcl.Access) { $DirAcl.RemoveAccessRule($rule) | Out-Null }
-$DirAcl.AddAccessRule(New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))
-$DirAcl.AddAccessRule(New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))
+$SysDirRule = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+$AdminDirRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+$DirAcl.AddAccessRule($SysDirRule)
+$DirAcl.AddAccessRule($AdminDirRule)
 Set-Acl -Path $ProtectedDir -AclObject $DirAcl
 
 # --- Cryptographic Migration ---
