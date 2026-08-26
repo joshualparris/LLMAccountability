@@ -3,16 +3,16 @@ import json
 import hashlib
 import sys
 import subprocess
+import tempfile
+import shutil
 
-AUDIT_LOG = os.path.abspath("agy_verification_audit.jsonl")
-
-def test_hash_chain():
-    print("Testing hash chain integrity...")
-    if not os.path.exists(AUDIT_LOG):
+def test_hash_chain(audit_log):
+    print("Testing hash chain integrity on...", audit_log)
+    if not os.path.exists(audit_log):
         print("No audit log found.")
         return
 
-    with open(AUDIT_LOG, "r", encoding="utf-8") as f:
+    with open(audit_log, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
     if not lines:
@@ -24,7 +24,6 @@ def test_hash_chain():
         record = json.loads(line)
         expected_hash = record.get("hash")
         
-        # Reconstruct the record to calculate its hash
         temp_record = {
             "timestamp": record["timestamp"],
             "claim": record["claim"],
@@ -41,43 +40,55 @@ def test_hash_chain():
         
         if calculated_hash != expected_hash:
             print(f"FAIL: Hash mismatch at line {i+1}!")
-            print(f"Expected: {expected_hash}")
-            print(f"Calculated: {calculated_hash}")
             sys.exit(1)
             
         prev_hash = expected_hash
         
-    print("PASS: Hash chain is fully intact and cryptographically sound.")
+    print("PASS: Hash chain is fully intact.")
 
 def test_tamper_detection():
-    print("Testing tamper detection...")
+    print("Testing fail-closed tamper detection...")
     
-    # Run the verifier once to create a valid record
-    subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], capture_output=True)
-    
-    with open(AUDIT_LOG, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    with tempfile.TemporaryDirectory() as tempdir:
+        test_log = os.path.join(tempdir, "test_audit.jsonl")
+        env = os.environ.copy()
+        env["AGY_AUDIT_LOG"] = test_log
         
-    # Tamper with the last record
-    last_record = json.loads(lines[-1])
-    last_record["status"] = "PASS" # Maliciously change FAIL to PASS
-    lines[-1] = json.dumps(last_record) + "\n"
-    
-    with open(AUDIT_LOG, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+        # Run verifier to create first valid record
+        subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], env=env, capture_output=True)
         
-    # Now run the integrity check again. It should fail!
-    print("Running integrity check on tampered log...")
-    try:
-        test_hash_chain()
-        print("FATAL: Tamper detection failed to catch the modification!")
-        sys.exit(1)
-    except SystemExit as e:
-        if e.code == 1:
-            print("PASS: Tamper detection successfully caught the modification.")
+        # Run again to create second valid record
+        subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], env=env, capture_output=True)
+        
+        with open(test_log, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            
+        # Tamper with the FIRST record
+        first_record = json.loads(lines[0])
+        first_record["status"] = "PASS" # Malicious edit
+        lines[0] = json.dumps(first_record) + "\n"
+        
+        with open(test_log, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+            
+        # Now run the verifier again. It MUST fail closed before doing anything.
+        print("Running verifier on tampered ledger...")
+        res = subprocess.run(["python", "agy_verifier.py", "certify", "--claim", "running", "--pid", "999999"], env=env, capture_output=True, text=True)
+        
+        if res.returncode == 0:
+            print("FATAL: Verifier issued a certificate despite a tampered ledger!")
+            print(res.stdout)
+            sys.exit(1)
+        elif "Ledger tampered or corrupted" in res.stderr:
+            print("PASS: Verifier correctly failed closed on tampered ledger.")
         else:
-            raise
+            print(f"Unexpected failure: {res.stderr}")
+            sys.exit(1)
 
 if __name__ == "__main__":
-    test_hash_chain()
+    # Test production ledger just to be sure it's intact
+    prod_log = os.path.abspath("agy_verification_audit.jsonl")
+    if os.path.exists(prod_log):
+        test_hash_chain(prod_log)
+        
     test_tamper_detection()

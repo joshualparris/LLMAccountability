@@ -9,7 +9,7 @@ import hashlib
 from datetime import datetime, timezone
 import uuid
 
-AUDIT_LOG_FILE = os.path.abspath("agy_verification_audit.jsonl")
+AUDIT_LOG_FILE = os.path.abspath(os.environ.get("AGY_AUDIT_LOG", "agy_verification_audit.jsonl"))
 
 def get_last_hash() -> str:
     if not os.path.exists(AUDIT_LOG_FILE):
@@ -20,9 +20,48 @@ def get_last_hash() -> str:
             if not lines:
                 return "0" * 64
             last_record = json.loads(lines[-1])
-            return last_record.get("hash", "0" * 64)
-    except Exception:
-        return "0" * 64
+            return last_record["hash"]
+    except Exception as e:
+        print(f"VERIFICATION FAILED: Audit log is corrupt or unreadable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def validate_ledger():
+    if not os.path.exists(AUDIT_LOG_FILE):
+        return
+    with open(AUDIT_LOG_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if not lines:
+        return
+        
+    prev_hash = "0" * 64
+    for i, line in enumerate(lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"VERIFICATION FAILED: Audit log corrupt at line {i+1}", file=sys.stderr)
+            sys.exit(1)
+            
+        expected_hash = record.get("hash")
+        
+        temp_record = {
+            "timestamp": record["timestamp"],
+            "claim": record["claim"],
+            "status": record["status"],
+            "evidence": record["evidence"]
+        }
+        if "error" in record:
+            temp_record["error"] = record["error"]
+            
+        temp_record["previous_hash"] = prev_hash
+        
+        canonical_json = json.dumps(temp_record, sort_keys=True)
+        calculated_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
+        
+        if calculated_hash != expected_hash:
+            print(f"VERIFICATION FAILED: Ledger tampered or corrupted at line {i+1}!", file=sys.stderr)
+            sys.exit(1)
+            
+        prev_hash = expected_hash
 
 def append_audit_log(record: dict):
     with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
@@ -100,6 +139,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "certify":
+        # Fail closed: must validate entire ledger before certifying
+        validate_ledger()
+        
         evidence = {}
         status = "UNKNOWN"
         error = None
