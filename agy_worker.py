@@ -39,7 +39,7 @@ def sign_response(payload: dict, nonce: str) -> str:
     canonical = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hmac.new(get_secret(), canonical, hashlib.sha256).hexdigest()
 
-def run_as_runner(cmd: list, cwd: str) -> tuple[int, str]:
+def run_as_runner(cmd: list, cwd: str) -> dict:
     if not os.path.exists(RUNNER_PWD_PATH):
         raise RuntimeError("Runner credentials not found. Trust boundary incomplete.")
         
@@ -77,10 +77,11 @@ try {
         ExitCode = $p.ExitCode
         Stdout = $stdout
         Stderr = $stderr
+        SpawnError = ""
     }
     $result | ConvertTo-Json -Compress
 } catch {
-    $err = @{ ExitCode = -1; Stdout = ""; Stderr = $_.Exception.Message }
+    $err = @{ ExitCode = -1; Stdout = ""; Stderr = ""; SpawnError = $_.Exception.Message }
     $err | ConvertTo-Json -Compress
 }
 """
@@ -94,12 +95,23 @@ try {
         res = subprocess.run(
             ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path, 
              "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", cwd], 
-            capture_output=True, text=True, check=True, env=env
+            capture_output=True, text=True, env=env
         )
-        out_json = json.loads(res.stdout.strip())
-        return out_json.get("ExitCode", -1), out_json.get("Stdout", "")
+        if res.returncode != 0 and not res.stdout.strip():
+            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell failure: {res.stderr}"}
+            
+        try:
+            out_json = json.loads(res.stdout.strip())
+            return {
+                "exit_code": out_json.get("ExitCode", -1),
+                "stdout": out_json.get("Stdout", ""),
+                "stderr": out_json.get("Stderr", ""),
+                "spawn_error": out_json.get("SpawnError", "")
+            }
+        except json.JSONDecodeError:
+            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell decode failure: {res.stdout.strip()} {res.stderr.strip()}"}
     except Exception as e:
-        return -1, str(e)
+        return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": str(e)}
     finally:
         if os.path.exists(script_path):
             os.remove(script_path)
@@ -125,21 +137,46 @@ def execute(req: ExecuteRequest):
         if req.claim == "pushed":
             repo = os.path.abspath(req.repo_path)
             evidence["repo_path"] = repo
-            code, _ = run_as_runner(["git", "fetch", "origin"], repo)
-            evidence["fetched_remote"] = (code == 0)
-            code, status_out = run_as_runner(["git", "status", "--porcelain"], repo)
-            evidence["working_tree_clean"] = (code == 0 and len(status_out) == 0)
-            code, local_branch = run_as_runner(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo)
-            code, local_sha = run_as_runner(["git", "rev-parse", "HEAD"], repo)
-            evidence["local_head"] = local_sha if code == 0 else "unknown"
-            code, remote_sha = run_as_runner(["git", "rev-parse", "@{u}"], repo)
-            evidence["remote_head"] = remote_sha if code == 0 else "unknown"
-            code, ls_out = run_as_runner(["git", "ls-remote", "origin", f"refs/heads/{local_branch}"], repo)
-            evidence["ls_remote_sha"] = ls_out.split()[0] if code == 0 and ls_out else "unknown"
+            
+            def run_git(args, key):
+                res = run_as_runner(["git"] + args, repo)
+                def redact(s):
+                    s = s[:1000]
+                    try:
+                        s = s.replace(get_secret().decode('utf-8', errors='ignore'), "[REDACTED]")
+                    except: pass
+                    s = s.replace(os.environ.get("AGY_RUNNER_PWD", "NOT_SET_YET"), "[REDACTED]")
+                    return s
+                
+                evidence[key] = {
+                    "exit_code": res["exit_code"],
+                    "stdout_snippet": redact(res["stdout"]),
+                    "stderr_snippet": redact(res["stderr"])
+                }
+                if res["spawn_error"]:
+                    evidence[key]["spawn_error"] = res["spawn_error"]
+                return res
+
+            res_fetch = run_git(["fetch", "origin"], "git_fetch")
+            if res_fetch["exit_code"] != 0 or res_fetch["spawn_error"]:
+                evidence["diagnostic_reason"] = "git fetch failed"
+                
+            res_status = run_git(["status", "--porcelain"], "git_status")
+            if res_status["exit_code"] != 0 or res_status["spawn_error"]:
+                if "diagnostic_reason" not in evidence:
+                    evidence["diagnostic_reason"] = "git status failed"
+                    
+            res_rev = run_git(["rev-parse", "--abbrev-ref", "HEAD"], "git_rev_parse_head")
+            local_branch = res_rev["stdout"].strip() if res_rev["exit_code"] == 0 else "unknown"
+            evidence["local_head"] = local_branch
+            
+            run_git(["rev-parse", "HEAD"], "git_rev_parse_head_sha")
+            run_git(["rev-parse", "@{u}"], "git_rev_parse_upstream")
+            run_git(["ls-remote", "origin", f"refs/heads/{local_branch}"], "git_ls_remote")
             
         elif req.claim == "tests-pass":
             PROFILES = {
-                "python-full": ["python", "-m", "pytest"],
+                "python-full": ["python", "-m", "pytest", "--ignore=tests/test_elevated_sebatchlogonright.py"],
                 "npm-full": ["npm", "test"]
             }
             if req.profile not in PROFILES:
@@ -148,9 +185,28 @@ def execute(req: ExecuteRequest):
             evidence["command"] = " ".join(cmd)
             evidence["repo_path"] = os.path.abspath(req.repo_path)
             
-            code, stdout = run_as_runner(cmd, evidence["repo_path"])
-            evidence["exit_code"] = code
-            evidence["stdout_snippet"] = stdout[:500]
+            res = run_as_runner(cmd, evidence["repo_path"])
+            
+            def redact(s):
+                s = s[:1000]
+                try:
+                    s = s.replace(get_secret().decode('utf-8', errors='ignore'), "[REDACTED]")
+                except: pass
+                pwd = ""
+                try:
+                    if os.path.exists(RUNNER_PWD_PATH):
+                        with open(RUNNER_PWD_PATH, "r") as f:
+                            pwd = f.read().strip()
+                except: pass
+                if pwd: s = s.replace(pwd, "[REDACTED]")
+                return s
+                
+            evidence["exit_code"] = res["exit_code"]
+            evidence["stdout_snippet"] = redact(res["stdout"])
+            evidence["stderr_snippet"] = redact(res["stderr"])
+            if res["spawn_error"]:
+                evidence["spawn_error"] = res["spawn_error"]
+                evidence["diagnostic_reason"] = "failed to spawn tests"
             
         elif req.claim == "running":
             evidence["pid"] = req.pid

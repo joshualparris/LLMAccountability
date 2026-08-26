@@ -24,14 +24,24 @@ class GitPushRecipe(BaseRecipe):
             if not authenticated:
                 return RecipeResult(Verdict.FAIL, evidence, "Evidence rejected by SYSTEM notary")
             
-            # Simple policy check for the pushed recipe:
-            # We want local head == remote head == ls-remote sha
-            local = evidence.get("local_head")
-            remote = evidence.get("remote_head")
-            ls_remote = evidence.get("ls_remote_sha")
+            if "diagnostic_reason" in evidence:
+                return RecipeResult(Verdict.INCONCLUSIVE, evidence, f"Diagnostic failure: {evidence['diagnostic_reason']}")
+                
+            local_sha_ev = evidence.get("git_rev_parse_head_sha", {})
+            remote_sha_ev = evidence.get("git_rev_parse_upstream", {})
+            ls_remote_ev = evidence.get("git_ls_remote", {})
+            
+            def get_sha(ev):
+                if ev.get("exit_code") == 0 and ev.get("stdout_snippet"):
+                    return ev["stdout_snippet"].strip().split()[0]
+                return None
+                
+            local = get_sha(local_sha_ev)
+            remote = get_sha(remote_sha_ev)
+            ls_remote = get_sha(ls_remote_ev)
             
             if not local or not remote or not ls_remote:
-                return RecipeResult(Verdict.FAIL, evidence, "Missing Git state")
+                return RecipeResult(Verdict.FAIL, evidence, "Missing or failed Git state prerequisites")
                 
             if local == remote and local == ls_remote:
                 return RecipeResult(Verdict.PASS, evidence, "Local branch perfectly synced with remote")

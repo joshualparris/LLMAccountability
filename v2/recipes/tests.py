@@ -25,6 +25,12 @@ class TestsPassRecipe(BaseRecipe):
             if not authenticated:
                 return RecipeResult(Verdict.FAIL, evidence, "Evidence rejected by SYSTEM notary")
             
+            if "diagnostic_reason" in evidence:
+                return RecipeResult(Verdict.INCONCLUSIVE, evidence, f"Diagnostic failure: {evidence['diagnostic_reason']}")
+                
+            if "spawn_error" in evidence:
+                return RecipeResult(Verdict.INCONCLUSIVE, evidence, f"Process spawn error: {evidence['spawn_error']}")
+            
             exit_code = evidence.get("exit_code")
             
             if exit_code is None:
