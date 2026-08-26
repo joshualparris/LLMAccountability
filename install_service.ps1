@@ -181,14 +181,14 @@ function Grant-LsaRight {
 }
 # --- END LSA HELPER ---
 
-$AppPath = "C:\dev\LLMAccountabilityApp"
+$RepoRoot = $PSScriptRoot
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
 
 $ServiceName = "AGYVerifierService"
-$ServiceExe = "$AppPath\dist\agy_service.exe"
+$ServiceExe = Join-Path $RepoRoot "dist\agy_service.exe"
 
 $WorkerName = "AGYVerifierWorker"
-$WorkerExe = "$AppPath\dist\agy_worker.exe"
+$WorkerExe = Join-Path $RepoRoot "dist\agy_worker.exe"
 $WorkerUser = "AGYWorker"
 
 $RunnerUser = "AGYRunner"
@@ -314,12 +314,39 @@ Write-Host "Starting all services..."
 Start-ScheduledTask -TaskName $ServiceName
 Start-ScheduledTask -TaskName $WorkerName
 
-Write-Host "Verifying service health..."
+Write-Host "Verifying service health and establishing public.pem ACL..."
 $MaxWait = 30
 $Passed = $false
 
+$PubKeyPath = "$ProtectedDir\public.pem"
+$AclSet = $false
+
 for ($i = 0; $i -lt $MaxWait; $i++) {
     Start-Sleep -Seconds 1
+    
+    if (-not $AclSet -and (Test-Path $PubKeyPath)) {
+        # Establish fail-closed ACLs on public.pem
+        $PubAcl = Get-Acl $PubKeyPath
+        $PubAcl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in $PubAcl.Access) { $PubAcl.RemoveAccessRule($rule) | Out-Null }
+        $PubAcl.AddAccessRule($SystemAccess)
+        $PubAcl.AddAccessRule($AdminAccess)
+        $UsersRead = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "Read", "None", "None", "Allow")
+        $PubAcl.AddAccessRule($UsersRead)
+        Set-Acl -Path $PubKeyPath -AclObject $PubAcl
+        
+        $TestAcl = Get-Acl $PubKeyPath
+        $hasUsers = $false
+        foreach ($r in $TestAcl.Access) {
+            if ($r.IdentityReference -eq "BUILTIN\Users" -and $r.FileSystemRights -match "Read") { $hasUsers = $true }
+            if ($r.IdentityReference -eq "BUILTIN\Users" -and $r.FileSystemRights -match "Write") { throw "CRITICAL: Users granted Write access to public.pem" }
+        }
+        if (-not $hasUsers) { throw "CRITICAL: Failed to grant Users read access to public.pem" }
+        
+        Write-Host "public.pem ACL established safely."
+        Write-Host "Public Key Fingerprint (SHA256): $((Get-FileHash $PubKeyPath -Algorithm SHA256).Hash)"
+        $AclSet = $true
+    }
     
     $SvcState = (Get-ScheduledTask -TaskName $ServiceName).State
     $WkrState = (Get-ScheduledTask -TaskName $WorkerName).State

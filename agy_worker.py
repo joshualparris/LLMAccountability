@@ -198,17 +198,21 @@ def execute(req: ExecuteRequest):
                 run_git(["ls-remote", "origin", f"refs/heads/{local_branch}"], "git_ls_remote")
             
         elif req.claim == "tests-pass":
+            repo_path = os.path.abspath(req.repo_path)
+            report_path = os.path.join(repo_path, f".agy_report_{job_nonce}.xml")
+            
             PROFILES = {
-                "python-full": ["python", "-m", "pytest", "--ignore=tests/test_elevated_sebatchlogonright.py"],
+                "python-full": ["python", "-m", "pytest", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--junitxml={report_path}"],
                 "npm-full": ["npm", "test"]
             }
             if req.profile not in PROFILES:
                 raise ValueError(f"Unknown profile {req.profile}")
             cmd = PROFILES[req.profile]
             evidence["command"] = " ".join(cmd)
-            evidence["repo_path"] = os.path.abspath(req.repo_path)
+            evidence["repo_path"] = repo_path
+            evidence["workspace_hash"] = get_file_sha256(os.path.join(repo_path, "pyproject.toml")) if os.path.exists(os.path.join(repo_path, "pyproject.toml")) else "unknown"
             
-            res = run_as_runner(cmd, evidence["repo_path"])
+            res = run_as_runner(cmd, repo_path)
             
             evidence["exit_code"] = res["exit_code"]
             evidence["stdout_snippet"] = sanitize_diagnostic(res["stdout"])
@@ -216,6 +220,30 @@ def execute(req: ExecuteRequest):
             if res["spawn_error"]:
                 evidence["spawn_error"] = sanitize_diagnostic(res["spawn_error"])
                 evidence["diagnostic_reason"] = sanitize_diagnostic("failed to spawn tests")
+                
+            if req.profile == "python-full" and os.path.exists(report_path):
+                import xml.etree.ElementTree as ET
+                try:
+                    tree = ET.parse(report_path)
+                    root = tree.getroot()
+                    # The root is typically testsuites, containing testsuite
+                    # Or it is testsuite directly
+                    if root.tag == "testsuites":
+                        suite = root.find("testsuite")
+                    else:
+                        suite = root
+                    
+                    if suite is not None:
+                        evidence["tests"] = int(suite.get("tests", 0))
+                        evidence["failures"] = int(suite.get("failures", 0))
+                        evidence["errors"] = int(suite.get("errors", 0))
+                        evidence["skipped"] = int(suite.get("skipped", 0))
+                        evidence["passed"] = evidence["tests"] - evidence["failures"] - evidence["errors"] - evidence["skipped"]
+                except Exception as e:
+                    evidence["diagnostic_reason"] = f"failed to parse junitxml: {e}"
+                finally:
+                    try: os.remove(report_path)
+                    except: pass
             
         elif req.claim == "running":
             evidence["pid"] = req.pid
