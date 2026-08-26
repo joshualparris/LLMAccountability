@@ -42,15 +42,31 @@ else:
 
 app = FastAPI(title="Antigravity Protected Verification Service")
 
+class ClaimEvidence(BaseModel):
+    # Git
+    fetched_remote: Optional[bool] = None
+    working_tree_clean: Optional[bool] = None
+    local_head: Optional[str] = None
+    remote_head: Optional[str] = None
+    ls_remote_sha: Optional[str] = None
+    # Tests
+    command: Optional[str] = None
+    exit_code: Optional[int] = None
+    # Process
+    pid: Optional[int] = None
+    executable_path: Optional[str] = None
+    actual_bin_hash: Optional[str] = None
+    expected_bin_hash: Optional[str] = None
+    # Endpoint
+    url: Optional[str] = None
+    expected_status: Optional[int] = None
+    actual_status: Optional[int] = None
+    expected_content: Optional[str] = None
+    content_found: Optional[bool] = None
+
 class ClaimRequest(BaseModel):
     claim: str
-    repo_path: str = "."
-    profile: Optional[str] = None
-    pid: Optional[int] = None
-    expected_bin_hash: Optional[str] = None
-    url: Optional[str] = None
-    expected_status: int = 200
-    expected_content: Optional[str] = None
+    evidence: ClaimEvidence
 
 def validate_ledger():
     if not os.path.exists(LEDGER_PATH):
@@ -105,7 +121,11 @@ def validate_ledger():
             canonical_record_for_sig = dict(record)
             del canonical_record_for_sig["signature_ed25519"]
             
-            public_key.verify(
+            # Re-read public key just for validation in case it's not loaded globally
+            with open(PUB_KEY_PATH, "rb") as f:
+                pub_key = serialization.load_pem_public_key(f.read(), password=None)
+                
+            pub_key.verify(
                 sig_bytes,
                 json.dumps(canonical_record_for_sig, sort_keys=True).encode("utf-8")
             )
@@ -130,26 +150,7 @@ def append_ledger(record: dict):
     with open(LEDGER_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
-def run_git(cmd: list, cwd: str) -> tuple[int, str]:
-    try:
-        res = subprocess.run(["git"] + cmd, cwd=cwd, capture_output=True, text=True, check=False)
-        return res.returncode, res.stdout.strip()
-    except Exception as e:
-        return -1, str(e)
-
-def get_file_sha256(filepath: str) -> str:
-    if not os.path.exists(filepath):
-        return None
-    hasher = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        buf = f.read(65536)
-        while len(buf) > 0:
-            hasher.update(buf)
-            buf = f.read(65536)
-    return hasher.hexdigest()
-
 def sign_record(record: dict) -> str:
-    # Sign the canonical JSON without the signature field itself
     canonical_json = json.dumps(record, sort_keys=True).encode("utf-8")
     signature = private_key.sign(canonical_json)
     return base64.b64encode(signature).decode("utf-8")
@@ -173,137 +174,40 @@ def certify(req: ClaimRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
         
-    evidence = {}
     status = "UNKNOWN"
     error = None
 
     try:
+        ev = req.evidence
         if req.claim == "pushed":
-            evidence["repo_path"] = os.path.abspath(req.repo_path)
-            
-            code, out = run_git(["fetch", "origin"], evidence["repo_path"])
-            evidence["fetched_remote"] = (code == 0)
-            if code != 0:
-                raise ValueError("Failed to fetch remote origin")
-
-            code, status_out = run_git(["status", "--porcelain"], evidence["repo_path"])
-            evidence["working_tree_clean"] = (code == 0 and len(status_out) == 0)
-            if not evidence["working_tree_clean"]:
-                raise ValueError("Working tree is dirty")
-
-            code, local_branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], evidence["repo_path"])
-            evidence["branch"] = local_branch
-
-            code, local_sha = run_git(["rev-parse", "HEAD"], evidence["repo_path"])
-            evidence["local_head"] = local_sha
-
-            code, remote_sha = run_git(["rev-parse", "@{u}"], evidence["repo_path"])
-            if code != 0:
-                 raise ValueError("No upstream branch configured")
-            evidence["remote_head"] = remote_sha
-
-            # Independent ls-remote check
-            code, ls_remote_out = run_git(["ls-remote", "origin", f"refs/heads/{local_branch}"], evidence["repo_path"])
-            if code != 0 or not ls_remote_out:
-                raise ValueError("Failed to verify remote SHA via ls-remote")
-            
-            ls_remote_sha = ls_remote_out.split()[0]
-            evidence["ls_remote_sha"] = ls_remote_sha
-
-            if local_sha == remote_sha == ls_remote_sha:
-                status = "PASS"
-            else:
-                raise ValueError(f"SHAs do not match: local={local_sha}, remote={remote_sha}, ls-remote={ls_remote_sha}")
+            if not ev.fetched_remote: raise ValueError("Failed to fetch remote origin")
+            if not ev.working_tree_clean: raise ValueError("Working tree is dirty")
+            if ev.local_head != ev.remote_head: raise ValueError("Local head does not match remote head")
+            if ev.local_head != ev.ls_remote_sha: raise ValueError("Local head does not match ls-remote SHA")
+            status = "PASS"
 
         elif req.claim == "tests-pass":
-            if not req.profile:
-                raise ValueError("Missing --profile for tests-pass")
-            
-            # Map profiles to hardcoded, safe commands
-            PROFILES = {
-                "python-full": ["python", "-m", "pytest"],
-                "npm-full": ["npm", "test"]
-            }
-            if req.profile not in PROFILES:
-                raise ValueError(f"Unknown test profile '{req.profile}'. Allowed: {list(PROFILES.keys())}")
-                
-            cmd = PROFILES[req.profile]
-            evidence["command"] = " ".join(cmd)
-            evidence["repo_path"] = os.path.abspath(req.repo_path)
-            
-            code, local_sha = run_git(["rev-parse", "HEAD"], evidence["repo_path"])
-            evidence["commit_sha"] = local_sha if code == 0 else "unknown"
-            
-            code, status_out = run_git(["status", "--porcelain"], evidence["repo_path"])
-            evidence["dirty_working_tree"] = (code != 0 or len(status_out) > 0)
-
-            # No shell=True!
-            res = subprocess.run(cmd, capture_output=True, text=True, cwd=evidence["repo_path"])
-            evidence["exit_code"] = res.returncode
-            evidence["stdout_snippet"] = res.stdout[:500]
-
-            if res.returncode == 0:
-                status = "PASS"
-            else:
-                raise ValueError(f"Tests failed with exit code {res.returncode}")
+            if ev.command not in ["python -m pytest", "npm test"]:
+                raise ValueError("Unauthorized test command")
+            if ev.exit_code != 0:
+                raise ValueError(f"Tests failed with exit code {ev.exit_code}")
+            status = "PASS"
 
         elif req.claim == "running":
-            if not req.pid:
-                raise ValueError("Missing --pid")
-            if not req.expected_bin_hash:
-                raise ValueError("Missing --expected-bin-hash. Process identity verification is mandatory.")
-            
-            evidence["pid"] = req.pid
-            
-            if not psutil.pid_exists(req.pid):
-                raise ValueError(f"Process with PID {req.pid} does not exist")
-            
-            proc = psutil.Process(req.pid)
-            if proc.status() == psutil.STATUS_ZOMBIE:
-                raise ValueError("Process is a zombie")
-
-            try:
-                exe_path = proc.exe()
-                evidence["executable_path"] = exe_path
-                
-                actual_hash = get_file_sha256(exe_path)
-                evidence["actual_bin_hash"] = actual_hash
-                evidence["expected_bin_hash"] = req.expected_bin_hash
-                
-                if actual_hash != req.expected_bin_hash:
-                    raise ValueError("Binary hash does not match expected hash (stale binary?)")
-
-                evidence["start_time"] = datetime.fromtimestamp(proc.create_time(), timezone.utc).isoformat()
-                evidence["command_line"] = proc.cmdline()
-                status = "PASS"
-                
-            except psutil.AccessDenied:
-                raise ValueError("Access denied reading process information")
+            if not ev.expected_bin_hash:
+                raise ValueError("Missing expected binary hash")
+            if ev.actual_bin_hash != ev.expected_bin_hash:
+                raise ValueError("Binary hash mismatch")
+            status = "PASS"
 
         elif req.claim == "endpoint-working":
-            if not req.url:
-                raise ValueError("Missing --url")
-            if not req.expected_content:
-                raise ValueError("Missing --expected-content. Endpoint identity/content verification is mandatory.")
-            
-            evidence["url"] = req.url
-            evidence["expected_status"] = req.expected_status
-            evidence["expected_content"] = req.expected_content
-            
-            try:
-                resp = requests.get(req.url, timeout=10)
-                evidence["actual_status"] = resp.status_code
-                
-                if resp.status_code != req.expected_status:
-                    raise ValueError(f"Status {resp.status_code} != {req.expected_status}")
-                    
-                evidence["content_snippet"] = resp.text[:500]
-                if req.expected_content not in resp.text:
-                    raise ValueError("Expected content not found in response")
-                        
-                status = "PASS"
-            except requests.exceptions.RequestException as e:
-                raise ValueError(f"Request failed: {str(e)}")
+            if not ev.expected_content:
+                raise ValueError("Missing expected content")
+            if ev.actual_status != ev.expected_status:
+                raise ValueError(f"Status {ev.actual_status} != {ev.expected_status}")
+            if not ev.content_found:
+                raise ValueError("Expected content not found in response")
+            status = "PASS"
 
         else:
             raise ValueError(f"Unsupported claim type: {req.claim}")
@@ -312,13 +216,12 @@ def certify(req: ClaimRequest):
         status = "FAIL"
         error = str(e)
 
-    # Generate record
     prev_hash = get_last_hash()
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "claim": req.claim,
         "status": status,
-        "evidence": evidence,
+        "evidence": req.evidence.dict(exclude_none=True),
         "previous_hash": prev_hash
     }
     if error:
@@ -331,9 +234,7 @@ def certify(req: ClaimRequest):
     cert_id = f"AGY-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{new_hash[:8]}"
     record["certificate_id"] = cert_id
     
-    # Sign it with Ed25519
     record["signature_ed25519"] = sign_record(record)
-    
     append_ledger(record)
     return record
 

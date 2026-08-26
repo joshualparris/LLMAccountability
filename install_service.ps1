@@ -7,16 +7,25 @@ $ErrorActionPreference = "Stop"
 $AppPath = "C:\dev\LLMAccountabilityApp"
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
 $TaskName = "AGYVerifierService"
-$PythonExe = (Get-Command python).Source
+$ServiceExe = "$AppPath\dist\agy_service.exe"
+
+if (-not (Test-Path $ServiceExe)) {
+    Write-Error "Could not find agy_service.exe. Did you freeze it with PyInstaller?"
+    exit 1
+}
 
 Write-Host "Creating protected directory..."
 if (-not (Test-Path $ProtectedDir)) {
     New-Item -ItemType Directory -Path $ProtectedDir | Out-Null
 }
 
-Write-Host "Copying service runtime to protected directory..."
-# Prevent privilege escalation by ensuring SYSTEM only runs code from the protected directory
-Copy-Item -Path "$AppPath\agy_service.py" -Destination "$ProtectedDir\agy_service.py" -Force
+Write-Host "Discarding any tainted pre-boundary cryptographic keys..."
+if (Test-Path "$ProtectedDir\private.pem") { Remove-Item "$ProtectedDir\private.pem" -Force }
+if (Test-Path "$ProtectedDir\public.pem") { Remove-Item "$ProtectedDir\public.pem" -Force }
+
+Write-Host "Copying compiled service runtime to protected directory..."
+# Prevent privilege escalation and runtime poisoning by using a frozen .exe
+Copy-Item -Path $ServiceExe -Destination "$ProtectedDir\agy_service.exe" -Force
 
 Write-Host "Locking down ACLs on $ProtectedDir..."
 # We want only SYSTEM and Administrators to have access.
@@ -42,8 +51,8 @@ if ($existingTask) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-# Execute the COPY of the script in the protected directory
-$Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "$ProtectedDir\agy_service.py" -WorkingDirectory $ProtectedDir
+# Execute the frozen executable inside the protected directory
+$Action = New-ScheduledTaskAction -Execute "$ProtectedDir\agy_service.exe" -WorkingDirectory $ProtectedDir
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
