@@ -204,35 +204,30 @@ def certify(req: ClaimRequest):
         ev = AttrDict(evidence)
 
         if req.claim == "pushed":
-            git_fetch = ev.get("git_fetch", {})
+            git_remote_url = ev.get("git_remote_url", {})
             git_status = ev.get("git_status", {})
             local_head = ev.get("git_rev_parse_head", {}).get("stdout_snippet", "").strip()
             ls_remote = ev.get("git_ls_remote", {}).get("stdout_snippet", "").strip()
             remote_sha = ls_remote.split()[0] if ls_remote else ""
             
-            fetch_succeeded = git_fetch.get("exit_code") == 0
+            remote_lookup_succeeded = git_remote_url.get("exit_code") == 0
             worktree_clean = git_status.get("exit_code") == 0 and git_status.get("stdout_snippet", "").strip() == ""
             local_branch = ev.get("local_branch", "unknown")
-            remote_url = ev.get("git_remote_url", {}).get("stdout_snippet", "").strip() # Assuming worker might emit this
+            remote_url = git_remote_url.get("stdout_snippet", "").strip()
             
-            if not fetch_succeeded: raise ValueError("Failed to fetch remote origin")
-            # If the user requires a clean tree, but AgentWitness does the check later, we probably just record the fact.
-            # But wait, original code did: if not ev.get("working_tree_clean"): raise ValueError("Working tree is dirty")
-            # Let's keep it strict or just pass the fact to AgentWitness.
-            # Let's raise ValueError to match original Notary strictness if required. Or actually, Notary should just authenticate the facts.
-            # Actually, Notary is just verifying the claim.
+            if not remote_lookup_succeeded: raise ValueError("Failed to lookup remote origin")
             if not local_head: raise ValueError("Could not get local HEAD")
             if not remote_sha: raise ValueError("Could not get remote HEAD")
             if local_head != remote_sha: raise ValueError(f"Local HEAD {local_head} does not match remote {remote_sha}")
             
             evidence = {
-                "fetch_succeeded": fetch_succeeded,
+                "remote_lookup_succeeded": remote_lookup_succeeded,
                 "worktree_clean": worktree_clean,
                 "local_head": local_head,
                 "local_branch": local_branch,
                 "remote_head": remote_sha,
                 "remote_url": remote_url,
-                "git_fetch": git_fetch,
+                "git_remote_url": git_remote_url,
                 "git_ls_remote": ev.get("git_ls_remote")
             }
             status = "PASS"

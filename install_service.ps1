@@ -1,3 +1,6 @@
+param(
+    [switch]$Preflight
+)
 $ErrorActionPreference = "Stop"
 
 function Invoke-NativeProcessWithTimeout {
@@ -196,6 +199,33 @@ $RunnerUser = "AGYRunner"
 if (-not (Test-Path $ServiceExe)) { Write-Error "Missing agy_service.exe"; exit 1 }
 if (-not (Test-Path $WorkerExe)) { Write-Error "Missing agy_worker.exe"; exit 1 }
 
+$ScratchDir = "C:\ProgramData\AGYScratch"
+
+if ($Preflight) {
+    Write-Host "Running Preflight checks..."
+    
+    $ManifestPath = Join-Path $RepoRoot "dist\build_manifest.json"
+    if (-not (Test-Path $ManifestPath)) { Write-Error "Missing build_manifest.json"; exit 1 }
+    
+    $Manifest = Get-Content $ManifestPath | ConvertFrom-Json
+    if (-not $Manifest.commit_sha) { Write-Error "Missing commit_sha in manifest"; exit 1 }
+    
+    $SvcHash = (Get-FileHash $ServiceExe -Algorithm SHA256).Hash
+    $WkrHash = (Get-FileHash $WorkerExe -Algorithm SHA256).Hash
+    
+    if ($SvcHash -ne $Manifest.built_binaries.'agy_service.exe') { Write-Error "agy_service.exe hash mismatch"; exit 1 }
+    if ($WkrHash -ne $Manifest.built_binaries.'agy_worker.exe') { Write-Error "agy_worker.exe hash mismatch"; exit 1 }
+    
+    $Port8123 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8123 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($Port8123) { Write-Error "Port 8123 is already occupied." }
+    
+    $GitStatus = (git -C $RepoRoot status --porcelain)
+    Write-Host "Git status: $GitStatus"
+    
+    Write-Host "Preflight complete. All checks passed."
+    exit 0
+}
+
 # --- User Creation ---
 Write-Host "Creating trusted local broker account ($WorkerUser)..."
 $WorkerPasswordStr = ([guid]::NewGuid().ToString() + "A1!")
@@ -243,6 +273,20 @@ $AdminDirRule = New-Object System.Security.AccessControl.FileSystemAccessRule("B
 $DirAcl.AddAccessRule($SysDirRule)
 $DirAcl.AddAccessRule($AdminDirRule)
 Set-Acl -Path $ProtectedDir -AclObject $DirAcl
+
+# --- Scratch Directory Setup ---
+Write-Host "Creating secure scratch directory..."
+if (-not (Test-Path $ScratchDir)) { New-Item -ItemType Directory -Path $ScratchDir | Out-Null }
+$ScratchAcl = Get-Acl $ScratchDir
+$ScratchAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in $ScratchAcl.Access) { $ScratchAcl.RemoveAccessRule($rule) | Out-Null }
+$ScratchAcl.AddAccessRule($SysDirRule)
+$ScratchAcl.AddAccessRule($AdminDirRule)
+$WorkerModify = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+$RunnerModify = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+$ScratchAcl.AddAccessRule($WorkerModify)
+$ScratchAcl.AddAccessRule($RunnerModify)
+Set-Acl -Path $ScratchDir -AclObject $ScratchAcl
 
 # --- Cryptographic Migration ---
 Write-Host "Handling cryptographic boundary and archiving legacy ledgers..."
@@ -366,14 +410,19 @@ for ($i = 0; $i -lt $MaxWait; $i++) {
     $Port8123 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8123 -InformationLevel Quiet -WarningAction SilentlyContinue
     $Port8124 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8124 -InformationLevel Quiet -WarningAction SilentlyContinue
     
-    if ($SvcState -eq 'Running' -and $WkrState -eq 'Running' -and $Port8123 -and $Port8124) {
+    if ($SvcState -eq 'Running' -and $WkrState -eq 'Running' -and $Port8123 -and $Port8124 -and $AclSet) {
         $Passed = $true
         break
     }
 }
 
 if (-not $Passed) {
-    Write-Error "NOT ESTABLISHED. Services failed to reach healthy Running/LISTENING state."
+    Write-Error "NOT ESTABLISHED. Services failed to reach healthy Running/LISTENING state, or ACLs were not set."
+    exit 1
+}
+
+if (-not (Test-Path $PubKeyPath) -or -not $AclSet) {
+    Write-Error "CRITICAL: public.pem does not exist or ACL setup was not verified."
     exit 1
 }
 

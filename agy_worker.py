@@ -151,11 +151,73 @@ def get_file_sha256(filepath: str) -> str:
         return None
     hasher = hashlib.sha256()
     with open(filepath, 'rb') as f:
-        buf = f.read(65536)
-        while len(buf) > 0:
-            hasher.update(buf)
-            buf = f.read(65536)
+        while chunk := f.read(8192):
+            hasher.update(chunk)
     return hasher.hexdigest()
+
+def _is_relevant(rel_path: str) -> bool:
+    from pathlib import Path
+    _RELEVANT_EXTENSIONS = {
+        ".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+        ".rs", ".go", ".java", ".kt", ".kts", ".scala", ".c", ".cc",
+        ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".sh",
+        ".ps1", ".psm1", ".toml", ".yaml", ".yml", ".json", ".xml",
+        ".ini", ".cfg", ".lock",
+    }
+    _RELEVANT_NAMES = {"Dockerfile", "Makefile", "Justfile", "Taskfile.yml"}
+    _IGNORED_PARTS = {
+        ".git", ".agentwitness", ".pytest_cache", "__pycache__", "node_modules",
+        "dist", "build", ".venv", "venv", "target", ".next", ".turbo",
+    }
+    p = Path(rel_path)
+    if any(part in _IGNORED_PARTS for part in p.parts):
+        return False
+    return p.name in _RELEVANT_NAMES or p.suffix.lower() in _RELEVANT_EXTENSIONS
+
+def _workspace_fingerprint(cwd: str) -> tuple[str, int]:
+    import os, subprocess, hashlib
+    from pathlib import Path
+    
+    root = Path(cwd).resolve()
+    try:
+        res = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True, check=False)
+        if res.returncode == 0 and res.stdout.strip():
+            root = Path(res.stdout.strip())
+    except Exception:
+        pass
+        
+    paths = []
+    try:
+        res = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=str(root), capture_output=True, check=False)
+        if res.returncode == 0:
+            paths = [p.decode("utf-8", errors="surrogateescape") for p in res.stdout.split(b"\0") if p]
+    except Exception:
+        pass
+        
+    if not paths:
+        for base, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in {
+                ".git", ".agentwitness", ".pytest_cache", "__pycache__", "node_modules",
+                "dist", "build", ".venv", "venv", "target", ".next", ".turbo",
+            }]
+            for name in files:
+                rel = str((Path(base) / name).relative_to(root)).replace("\\", "/")
+                paths.append(rel)
+                
+    relevant = sorted({p.replace("\\", "/") for p in paths if _is_relevant(p)})
+    digest = hashlib.sha256()
+    count = 0
+    for rel in relevant:
+        path = root / rel
+        if not path.is_file(): continue
+        try:
+            data = path.read_bytes()
+        except OSError: continue
+        digest.update(rel.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(data).digest())
+        count += 1
+    return digest.hexdigest(), count
 
 @app.post("/execute")
 def execute(req: ExecuteRequest):
@@ -199,10 +261,14 @@ def execute(req: ExecuteRequest):
             
         elif req.claim == "tests-pass":
             repo_path = os.path.abspath(req.repo_path)
-            report_path = os.path.join(repo_path, f".agy_report_{job_nonce}.xml")
+            
+            scratch_base = "C:\\ProgramData\\AGYScratch"
+            scratch_dir = os.path.join(scratch_base, job_nonce)
+            os.makedirs(scratch_dir, exist_ok=True)
+            report_path = os.path.join(scratch_dir, "report.xml")
             
             PROFILES = {
-                "python-full": ["python", "-m", "pytest", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--junitxml={report_path}"],
+                "python-full": ["python", "-m", "pytest", "-p", "no:cacheprovider", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--junitxml={report_path}"],
                 "npm-full": ["npm", "test"]
             }
             if req.profile not in PROFILES:
@@ -210,8 +276,13 @@ def execute(req: ExecuteRequest):
             cmd = PROFILES[req.profile]
             evidence["command"] = " ".join(cmd)
             evidence["repo_path"] = repo_path
-            evidence["workspace_hash"] = get_file_sha256(os.path.join(repo_path, "pyproject.toml")) if os.path.exists(os.path.join(repo_path, "pyproject.toml")) else "unknown"
             
+            fp, fp_count = _workspace_fingerprint(repo_path)
+            evidence["workspace_fingerprint"] = fp
+            evidence["workspace_file_count"] = fp_count
+            
+            # Set PYTHONDONTWRITEBYTECODE=1 in the worker environment so it inherits to the runner script
+            os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
             res = run_as_runner(cmd, repo_path)
             
             evidence["exit_code"] = res["exit_code"]
@@ -226,8 +297,6 @@ def execute(req: ExecuteRequest):
                 try:
                     tree = ET.parse(report_path)
                     root = tree.getroot()
-                    # The root is typically testsuites, containing testsuite
-                    # Or it is testsuite directly
                     if root.tag == "testsuites":
                         suite = root.find("testsuite")
                     else:
@@ -241,9 +310,9 @@ def execute(req: ExecuteRequest):
                         evidence["passed"] = evidence["tests"] - evidence["failures"] - evidence["errors"] - evidence["skipped"]
                 except Exception as e:
                     evidence["diagnostic_reason"] = f"failed to parse junitxml: {e}"
-                finally:
-                    try: os.remove(report_path)
-                    except: pass
+                
+            import shutil
+            shutil.rmtree(scratch_dir, ignore_errors=True)
             
         elif req.claim == "running":
             evidence["pid"] = req.pid
