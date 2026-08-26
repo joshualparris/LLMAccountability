@@ -231,3 +231,21 @@ def test_installer_health_checks_exist():
     assert "8123" in content
     assert "8124" in content
     assert "Running" in content
+
+def test_scheduled_task_settings_compatibility():
+    import subprocess
+    ps_script = """
+    $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    if ($s.DisallowStartIfOnBatteries -ne $false) { throw 'DisallowStartIfOnBatteries is not false' }
+    if ($s.StopIfGoingOnBatteries -ne $false) { throw 'StopIfGoingOnBatteries is not false' }
+    if ($s.StartWhenAvailable -ne $true) { throw 'StartWhenAvailable is not true' }
+    if ($s.AllowDemandStart -ne $true) { throw 'AllowDemandStart is not true' }
+    """
+    cmd = ["powershell", "-NoProfile", "-Command", ps_script]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, f"ScheduledTaskSettings compat failed: {result.stderr}"
+
+def test_installer_no_invalid_parameters():
+    with open("install_service.ps1", "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "-AllowDemandStart" not in content
