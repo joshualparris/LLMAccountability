@@ -3,7 +3,16 @@ import subprocess
 import os
 import uuid
 
+import ctypes
+
 def test_sebatchlogonright_lsa_integration():
+    try:
+        is_admin = os.getuid() == 0
+    except AttributeError:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+    if not is_admin:
+        pytest.skip("Test requires elevation")
+        
     test_user = f"AGYTest_{uuid.uuid4().hex[:6]}"
     pwd = f"Password_{uuid.uuid4().hex[:6]}!"
     subprocess.run(["powershell", "-NoProfile", "-Command", f"$sec = ConvertTo-SecureString '{pwd}' -AsPlainText -Force; New-LocalUser -Name '{test_user}' -Password $sec"], check=True)

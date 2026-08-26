@@ -6,6 +6,7 @@ import hmac
 import json
 import tempfile
 import psutil
+import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -34,10 +35,39 @@ def get_secret():
         return f.read().strip()
 
 def sign_response(payload: dict, nonce: str) -> str:
-    # Bind the nonce securely into the evidence payload before signing
     payload["nonce"] = nonce
     canonical = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hmac.new(get_secret(), canonical, hashlib.sha256).hexdigest()
+
+def sanitize_diagnostic(text: str) -> str:
+    if not text:
+        return ""
+        
+    pwd = ""
+    try:
+        if os.path.exists(RUNNER_PWD_PATH):
+            with open(RUNNER_PWD_PATH, "r") as f:
+                pwd = f.read().strip()
+    except Exception:
+        pass
+        
+    if pwd:
+        text = text.replace(pwd, "[REDACTED]")
+
+    # Redact common credential patterns BEFORE truncating
+    patterns = [
+        r"github_pat_[a-zA-Z0-9_]+",
+        r"ghp_[a-zA-Z0-9]+",
+        r"(?i)bearer\s+[A-Za-z0-9\-\._~\+/]+=*",
+        r"(?i)authorization:\s*bearer\s+[A-Za-z0-9\-\._~\+/]+=*",
+        r"https?://[^:\s@]+:[^@\s]+@",
+        r"(?i)(?:access_token|token|api_key|password)\s*[:=]\s*['\"]?[A-Za-z0-9\-\._~\+/]+['\"]?"
+    ]
+    
+    for pat in patterns:
+        text = re.sub(pat, "[REDACTED]", text)
+        
+    return text[:1000]
 
 def run_as_runner(cmd: list, cwd: str) -> dict:
     if not os.path.exists(RUNNER_PWD_PATH):
@@ -140,39 +170,32 @@ def execute(req: ExecuteRequest):
             
             def run_git(args, key):
                 res = run_as_runner(["git"] + args, repo)
-                def redact(s):
-                    s = s[:1000]
-                    try:
-                        s = s.replace(get_secret().decode('utf-8', errors='ignore'), "[REDACTED]")
-                    except: pass
-                    s = s.replace(os.environ.get("AGY_RUNNER_PWD", "NOT_SET_YET"), "[REDACTED]")
-                    return s
-                
                 evidence[key] = {
                     "exit_code": res["exit_code"],
-                    "stdout_snippet": redact(res["stdout"]),
-                    "stderr_snippet": redact(res["stderr"])
+                    "stdout_snippet": sanitize_diagnostic(res["stdout"]),
+                    "stderr_snippet": sanitize_diagnostic(res["stderr"])
                 }
                 if res["spawn_error"]:
-                    evidence[key]["spawn_error"] = res["spawn_error"]
+                    evidence[key]["spawn_error"] = sanitize_diagnostic(res["spawn_error"])
                 return res
 
             res_fetch = run_git(["fetch", "origin"], "git_fetch")
             if res_fetch["exit_code"] != 0 or res_fetch["spawn_error"]:
-                evidence["diagnostic_reason"] = "git fetch failed"
+                evidence["diagnostic_reason"] = sanitize_diagnostic("git fetch failed")
                 
             res_status = run_git(["status", "--porcelain"], "git_status")
             if res_status["exit_code"] != 0 or res_status["spawn_error"]:
                 if "diagnostic_reason" not in evidence:
-                    evidence["diagnostic_reason"] = "git status failed"
+                    evidence["diagnostic_reason"] = sanitize_diagnostic("git status failed")
                     
-            res_rev = run_git(["rev-parse", "--abbrev-ref", "HEAD"], "git_rev_parse_head")
+            res_rev = run_git(["rev-parse", "--abbrev-ref", "HEAD"], "git_rev_parse_branch")
             local_branch = res_rev["stdout"].strip() if res_rev["exit_code"] == 0 else "unknown"
-            evidence["local_head"] = local_branch
+            evidence["local_branch"] = sanitize_diagnostic(local_branch)
             
-            run_git(["rev-parse", "HEAD"], "git_rev_parse_head_sha")
+            run_git(["rev-parse", "HEAD"], "git_rev_parse_head")
             run_git(["rev-parse", "@{u}"], "git_rev_parse_upstream")
-            run_git(["ls-remote", "origin", f"refs/heads/{local_branch}"], "git_ls_remote")
+            if local_branch != "unknown":
+                run_git(["ls-remote", "origin", f"refs/heads/{local_branch}"], "git_ls_remote")
             
         elif req.claim == "tests-pass":
             PROFILES = {
@@ -187,26 +210,12 @@ def execute(req: ExecuteRequest):
             
             res = run_as_runner(cmd, evidence["repo_path"])
             
-            def redact(s):
-                s = s[:1000]
-                try:
-                    s = s.replace(get_secret().decode('utf-8', errors='ignore'), "[REDACTED]")
-                except: pass
-                pwd = ""
-                try:
-                    if os.path.exists(RUNNER_PWD_PATH):
-                        with open(RUNNER_PWD_PATH, "r") as f:
-                            pwd = f.read().strip()
-                except: pass
-                if pwd: s = s.replace(pwd, "[REDACTED]")
-                return s
-                
             evidence["exit_code"] = res["exit_code"]
-            evidence["stdout_snippet"] = redact(res["stdout"])
-            evidence["stderr_snippet"] = redact(res["stderr"])
+            evidence["stdout_snippet"] = sanitize_diagnostic(res["stdout"])
+            evidence["stderr_snippet"] = sanitize_diagnostic(res["stderr"])
             if res["spawn_error"]:
-                evidence["spawn_error"] = res["spawn_error"]
-                evidence["diagnostic_reason"] = "failed to spawn tests"
+                evidence["spawn_error"] = sanitize_diagnostic(res["spawn_error"])
+                evidence["diagnostic_reason"] = sanitize_diagnostic("failed to spawn tests")
             
         elif req.claim == "running":
             evidence["pid"] = req.pid
@@ -231,7 +240,7 @@ def execute(req: ExecuteRequest):
                 evidence["content_found"] = False
                 
     except Exception as e:
-        evidence["error"] = str(e)
+        evidence["error"] = sanitize_diagnostic(str(e))
 
     clean_evidence = {k: v for k, v in evidence.items() if v is not None}
     

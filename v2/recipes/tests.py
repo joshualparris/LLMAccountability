@@ -33,8 +33,8 @@ class TestsPassRecipe(BaseRecipe):
             
             exit_code = evidence.get("exit_code")
             
-            if exit_code is None:
-                return RecipeResult(Verdict.INCONCLUSIVE, evidence, "No exit code reported by runner")
+            if exit_code is None or exit_code == -1:
+                return RecipeResult(Verdict.INCONCLUSIVE, evidence, "No valid exit code reported by runner")
                 
             if exit_code == 0:
                 return RecipeResult(Verdict.PASS, evidence, "Test command returned exit code 0")
