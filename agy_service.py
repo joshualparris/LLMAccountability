@@ -42,129 +42,32 @@ else:
 
 app = FastAPI(title="Antigravity Protected Verification Service")
 
-class ClaimEvidence(BaseModel):
-    # Git
-    fetched_remote: Optional[bool] = None
-    working_tree_clean: Optional[bool] = None
-    local_head: Optional[str] = None
-    remote_head: Optional[str] = None
-    ls_remote_sha: Optional[str] = None
-    # Tests
-    command: Optional[str] = None
-    exit_code: Optional[int] = None
-    # Process
-    pid: Optional[int] = None
-    executable_path: Optional[str] = None
-    actual_bin_hash: Optional[str] = None
-    expected_bin_hash: Optional[str] = None
-    # Endpoint
-    url: Optional[str] = None
-    expected_status: Optional[int] = None
-    actual_status: Optional[int] = None
-    expected_content: Optional[str] = None
-    content_found: Optional[bool] = None
+SECRET_PATH = os.path.join(PROTECTED_DIR, "worker_secret.key")
+WORKER_URL = "http://127.0.0.1:8124/execute"
+
+def get_secret():
+    if not os.path.exists(SECRET_PATH):
+        # Generate on first run if missing
+        secret = os.urandom(32)
+        with open(SECRET_PATH, "wb") as f:
+            f.write(secret)
+    with open(SECRET_PATH, "rb") as f:
+        return f.read().strip()
+
+def verify_worker_signature(evidence: dict, signature: str) -> bool:
+    canonical = json.dumps(evidence, sort_keys=True).encode("utf-8")
+    expected = hmac.new(get_secret(), canonical, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
 class ClaimRequest(BaseModel):
     claim: str
-    evidence: ClaimEvidence
-
-def validate_ledger():
-    if not os.path.exists(LEDGER_PATH):
-        return
-    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    if not lines:
-        return
-        
-    prev_hash = "0" * 64
-    for i, line in enumerate(lines):
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            raise RuntimeError(f"Audit log corrupt at line {i+1}")
-            
-        expected_hash = record.get("hash")
-        if record.get("previous_hash") != prev_hash:
-            raise RuntimeError(f"previous_hash mismatch at line {i+1}")
-            
-        temp_record = {
-            "timestamp": record["timestamp"],
-            "claim": record["claim"],
-            "status": record["status"],
-            "evidence": record["evidence"],
-            "previous_hash": prev_hash
-        }
-        if "error" in record:
-            temp_record["error"] = record["error"]
-            
-        canonical_json = json.dumps(temp_record, sort_keys=True)
-        calculated_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
-        
-        if calculated_hash != expected_hash:
-            raise RuntimeError(f"Ledger tampered or corrupted at line {i+1}!")
-            
-        # Reconstruct expected cert ID
-        try:
-            ts = datetime.fromisoformat(record["timestamp"])
-            expected_cert_id = f"AGY-{ts.strftime('%Y%m%d')}-{calculated_hash[:8]}"
-            if record.get("certificate_id") != expected_cert_id:
-                raise RuntimeError(f"certificate_id mismatch at line {i+1}")
-        except ValueError:
-            raise RuntimeError(f"Invalid timestamp format at line {i+1}")
-            
-        # Verify Ed25519 Signature
-        sig_b64 = record.get("signature_ed25519")
-        if not sig_b64:
-            raise RuntimeError(f"Missing signature at line {i+1}")
-        try:
-            sig_bytes = base64.b64decode(sig_b64)
-            canonical_record_for_sig = dict(record)
-            del canonical_record_for_sig["signature_ed25519"]
-            
-            # Re-read public key just for validation in case it's not loaded globally
-            with open(PUB_KEY_PATH, "rb") as f:
-                pub_key = serialization.load_pem_public_key(f.read(), password=None)
-                
-            pub_key.verify(
-                sig_bytes,
-                json.dumps(canonical_record_for_sig, sort_keys=True).encode("utf-8")
-            )
-        except Exception:
-            raise RuntimeError(f"Invalid cryptographic signature at line {i+1}")
-            
-        prev_hash = expected_hash
-
-def get_last_hash() -> str:
-    if not os.path.exists(LEDGER_PATH):
-        return "0" * 64
-    try:
-        with open(LEDGER_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-            if not lines:
-                return "0" * 64
-            return json.loads(lines[-1])["hash"]
-    except Exception as e:
-        raise RuntimeError(f"Audit log is corrupt or unreadable: {e}")
-
-def append_ledger(record: dict):
-    with open(LEDGER_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
-
-def sign_record(record: dict) -> str:
-    canonical_json = json.dumps(record, sort_keys=True).encode("utf-8")
-    signature = private_key.sign(canonical_json)
-    return base64.b64encode(signature).decode("utf-8")
-
-@app.get("/ledger")
-def get_ledger():
-    if not os.path.exists(LEDGER_PATH):
-        return []
-    records = []
-    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    return records
+    repo_path: str = "."
+    profile: Optional[str] = None
+    pid: Optional[int] = None
+    expected_bin_hash: Optional[str] = None
+    url: Optional[str] = None
+    expected_status: int = 200
+    expected_content: Optional[str] = None
 
 @app.post("/certify")
 def certify(req: ClaimRequest):
@@ -176,36 +79,53 @@ def certify(req: ClaimRequest):
         
     status = "UNKNOWN"
     error = None
+    evidence = {}
 
     try:
-        ev = req.evidence
+        # Request execution from unprivileged worker
+        payload = req.dict(exclude_none=True)
+        resp = requests.post(WORKER_URL, json=payload, timeout=30)
+        
+        if resp.status_code != 200:
+            raise ValueError(f"Worker execution failed: {resp.text}")
+            
+        worker_resp = resp.json()
+        evidence = worker_resp.get("evidence", {})
+        sig = worker_resp.get("signature")
+        
+        if not sig or not verify_worker_signature(evidence, sig):
+            raise ValueError("Worker evidence signature is missing or invalid. Potential forgery detected.")
+            
+        if "error" in evidence:
+            raise ValueError(f"Worker encountered error: {evidence['error']}")
+
+        class AttrDict(dict):
+            def __init__(self, *args, **kwargs):
+                super(AttrDict, self).__init__(*args, **kwargs)
+                self.__dict__ = self
+        ev = AttrDict(evidence)
+
         if req.claim == "pushed":
-            if not ev.fetched_remote: raise ValueError("Failed to fetch remote origin")
-            if not ev.working_tree_clean: raise ValueError("Working tree is dirty")
-            if ev.local_head != ev.remote_head: raise ValueError("Local head does not match remote head")
-            if ev.local_head != ev.ls_remote_sha: raise ValueError("Local head does not match ls-remote SHA")
+            if not ev.get("fetched_remote"): raise ValueError("Failed to fetch remote origin")
+            if not ev.get("working_tree_clean"): raise ValueError("Working tree is dirty")
+            if ev.get("local_head") != ev.get("remote_head"): raise ValueError("Local head does not match remote head")
+            if ev.get("local_head") != ev.get("ls_remote_sha"): raise ValueError("Local head does not match ls-remote SHA")
             status = "PASS"
 
         elif req.claim == "tests-pass":
-            if ev.command not in ["python -m pytest", "npm test"]:
-                raise ValueError("Unauthorized test command")
-            if ev.exit_code != 0:
-                raise ValueError(f"Tests failed with exit code {ev.exit_code}")
+            if ev.get("exit_code") != 0:
+                raise ValueError(f"Tests failed with exit code {ev.get('exit_code')}")
             status = "PASS"
 
         elif req.claim == "running":
-            if not ev.expected_bin_hash:
-                raise ValueError("Missing expected binary hash")
-            if ev.actual_bin_hash != ev.expected_bin_hash:
+            if ev.get("actual_bin_hash") != req.expected_bin_hash:
                 raise ValueError("Binary hash mismatch")
             status = "PASS"
 
         elif req.claim == "endpoint-working":
-            if not ev.expected_content:
-                raise ValueError("Missing expected content")
-            if ev.actual_status != ev.expected_status:
-                raise ValueError(f"Status {ev.actual_status} != {ev.expected_status}")
-            if not ev.content_found:
+            if ev.get("actual_status") != req.expected_status:
+                raise ValueError(f"Status {ev.get('actual_status')} != {req.expected_status}")
+            if not ev.get("content_found"):
                 raise ValueError("Expected content not found in response")
             status = "PASS"
 
@@ -221,7 +141,7 @@ def certify(req: ClaimRequest):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "claim": req.claim,
         "status": status,
-        "evidence": req.evidence.dict(exclude_none=True),
+        "evidence": evidence,
         "previous_hash": prev_hash
     }
     if error:
