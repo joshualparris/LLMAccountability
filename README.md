@@ -33,17 +33,19 @@ If the verifier is satisfied, it outputs machine-readable JSON containing the Ce
 Antigravity is then forced by its rules to output:
 > Tests pass — **AGY-20260826-1a2b3c4d PASS**
 
-## Architectural Limitations & Trust Boundary (v0.4+)
+## Deployment (v1.1)
 
-While the ledger is cryptographically tamper-evident, this framework currently operates within the same trust domain as the agent. Because the agent executes the verifier and controls the environment:
-1. **Ledger Substitution:** An agent could theoretically modify the script to point to a fresh ledger.
-2. **Ledger Rewrite:** An adversary with write access could rewrite an old record, recompute all subsequent hashes, and replace the entire ledger.
-3. **Lack of Trust Anchor:** The `verifier_hash` proves provenance, but there is no external trust anchor enforcing a known-good hash.
+To fully cross the trust boundary, the verifier must be installed as a protected Windows service.
 
-To achieve genuine non-repudiation, a strict **trust boundary** is required:
-* The verifier must run as a protected, independent service (e.g., a protected Windows service).
-* The ledger must be write-only to the agent.
-* Certificates must be cryptographically signed (HMAC) by the service using a secret key inaccessible to the agent.
+1. Open an **Elevated (Admin) PowerShell**.
+2. Run `.\install_service.ps1`
+   - This script creates `C:\ProgramData\AGYVerifier`.
+   - It strips permissions and assigns Full Control *only* to `SYSTEM` and `Administrators`, explicitly denying the Antigravity agent process from tampering with the private key or modifying the ledger.
+   - It registers a Scheduled Task to run the backend service as `NT AUTHORITY\SYSTEM` on startup.
+   - Without running this, the trust boundary remains theoretical!
+
+## Viewing the Ledger
+Run `python agy_gui.py` to launch a local desktop application that reads the protected ledger and displays all generated cryptographic certificates and their signatures.
 I deliberately passed the verifier failing scenarios to ensure it correctly denies certificates:
 - **Fake endpoint**: Rejected with a `FAIL` status and the `Max retries exceeded` request error.
 - **Uninitialized Git Repo**: Rejected the `pushed` claim with a `FAIL` because it failed to fetch the remote origin.

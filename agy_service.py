@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
 # Protected paths
-PROTECTED_DIR = os.path.abspath(os.environ.get("AGY_PROTECTED_DIR", "C:/ProgramData/AGYVerifier"))
+PROTECTED_DIR = os.path.abspath("C:/ProgramData/AGYVerifier")
 os.makedirs(PROTECTED_DIR, exist_ok=True)
 
 LEDGER_PATH = os.path.join(PROTECTED_DIR, "protected_ledger.jsonl")
@@ -52,14 +52,54 @@ class ClaimRequest(BaseModel):
     expected_status: int = 200
     expected_content: Optional[str] = None
 
+def validate_ledger():
+    if not os.path.exists(LEDGER_PATH):
+        return
+    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if not lines:
+        return
+        
+    prev_hash = "0" * 64
+    for i, line in enumerate(lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Audit log corrupt at line {i+1}")
+            
+        expected_hash = record.get("hash")
+        if record.get("previous_hash") != prev_hash:
+            raise RuntimeError(f"previous_hash mismatch at line {i+1}")
+            
+        temp_record = {
+            "timestamp": record["timestamp"],
+            "claim": record["claim"],
+            "status": record["status"],
+            "evidence": record["evidence"],
+            "previous_hash": prev_hash
+        }
+        if "error" in record:
+            temp_record["error"] = record["error"]
+            
+        canonical_json = json.dumps(temp_record, sort_keys=True)
+        calculated_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
+        
+        if calculated_hash != expected_hash:
+            raise RuntimeError(f"Ledger tampered or corrupted at line {i+1}!")
+            
+        prev_hash = expected_hash
+
 def get_last_hash() -> str:
     if not os.path.exists(LEDGER_PATH):
         return "0" * 64
-    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-        if not lines:
-            return "0" * 64
-        return json.loads(lines[-1])["hash"]
+    try:
+        with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            if not lines:
+                return "0" * 64
+            return json.loads(lines[-1])["hash"]
+    except Exception as e:
+        raise RuntimeError(f"Audit log is corrupt or unreadable: {e}")
 
 def append_ledger(record: dict):
     with open(LEDGER_PATH, "a", encoding="utf-8") as f:
@@ -91,6 +131,12 @@ def sign_record(record: dict) -> str:
 
 @app.post("/certify")
 def certify(req: ClaimRequest):
+    # Enforce fail-closed ledger validation before taking any action
+    try:
+        validate_ledger()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
     evidence = {}
     status = "UNKNOWN"
     error = None
