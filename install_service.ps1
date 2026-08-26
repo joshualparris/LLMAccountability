@@ -1,5 +1,13 @@
 $ErrorActionPreference = "Stop"
 
+function Invoke-NativeCommand {
+    param([scriptblock]$Command)
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "Native command failed with exit code $($LASTEXITCODE): $($Command.ToString())"
+    }
+}
+
 $AppPath = "C:\dev\LLMAccountabilityApp"
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
 
@@ -35,55 +43,106 @@ if (-not (Get-LocalUser -Name $RunnerUser -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host "Configuring local security policy for SeBatchLogonRight..."
-$tempSecPol = [IO.Path]::GetTempFileName()
-$tempDb = [IO.Path]::GetTempFileName()
-secedit.exe /export /cfg $tempSecPol /areas USER_RIGHTS | Out-Null
-$secPolContent = Get-Content $tempSecPol
+$tempInf = Join-Path $env:TEMP ("agy-" + [guid]::NewGuid() + ".inf")
+$tempDb  = Join-Path $env:TEMP ("agy-" + [guid]::NewGuid() + ".sdb")
+$tempLog = Join-Path $env:TEMP ("agy-" + [guid]::NewGuid() + ".log")
 
-$workerSid = (New-Object System.Security.Principal.NTAccount($WorkerUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+Invoke-NativeCommand { secedit.exe /export /cfg $tempInf /areas USER_RIGHTS }
+
+$secPolContent = Get-Content $tempInf -Encoding Unicode
+
+$workerSid = (New-Object System.Security.Principal.NTAccount("$env:COMPUTERNAME\$WorkerUser")).Translate([System.Security.Principal.SecurityIdentifier]).Value
 $workerSidTarget = "*$workerSid"
 
-# 3. Explicitly detect "Deny log on as a batch job" conflicts
 $denyLines = $secPolContent | Where-Object { $_ -match "^\s*SeDenyBatchLogonRight\s*=" }
 foreach ($denyLine in $denyLines) {
     if ($denyLine -match [regex]::Escape($workerSidTarget)) {
-        Remove-Item $tempSecPol -Force
-        Remove-Item $tempDb -Force
+        Remove-Item $tempInf -Force -ErrorAction SilentlyContinue
         Write-Error "CRITICAL: AGYWorker is explicitly denied log on as a batch job (SeDenyBatchLogonRight). Cannot proceed."
         exit 1
     }
 }
 
 $updated = $false
-$batchLines = $secPolContent | Where-Object { $_ -match "^\s*SeBatchLogonRight\s*=" }
-
+$hasPrivSection = $false
 $newContent = @()
-if ($batchLines.Count -gt 0) {
-    foreach ($line in $secPolContent) {
-        if ($line -match "^\s*SeBatchLogonRight\s*=") {
-            if ($line -notmatch [regex]::Escape($workerSidTarget)) {
-                $line = "$line,$workerSidTarget"
+
+foreach ($line in $secPolContent) {
+    if ($line -match "^\s*\[Privilege Rights\]") {
+        $hasPrivSection = $true
+    }
+    
+    if ($line -match "^\s*SeBatchLogonRight\s*=") {
+        if ($line -notmatch [regex]::Escape($workerSidTarget)) {
+            $line = "$line,$workerSidTarget"
+            $updated = $true
+        }
+    }
+    $newContent += $line
+}
+
+if (-not $hasPrivSection) {
+    $newContent += "[Privilege Rights]"
+    $newContent += "SeBatchLogonRight = $workerSidTarget"
+    $updated = $true
+} else {
+    $batchFound = $secPolContent | Where-Object { $_ -match "^\s*SeBatchLogonRight\s*=" }
+    if (-not $batchFound) {
+        $finalContent = @()
+        foreach ($line in $newContent) {
+            $finalContent += $line
+            if ($line -match "^\s*\[Privilege Rights\]") {
+                $finalContent += "SeBatchLogonRight = $workerSidTarget"
                 $updated = $true
             }
         }
-        $newContent += $line
-    }
-} else {
-    foreach ($line in $secPolContent) {
-        $newContent += $line
-        if ($line -match "^\s*\[Privilege Rights\]\s*$") {
-            $newContent += "SeBatchLogonRight = $workerSidTarget"
-            $updated = $true
-        }
+        $newContent = $finalContent
     }
 }
 
 if ($updated) {
-    $newContent | Set-Content $tempSecPol
-    secedit.exe /configure /db $tempDb /cfg $tempSecPol /areas USER_RIGHTS | Out-Null
+    $newContent | Out-File -FilePath $tempInf -Encoding Unicode
+    
+    secedit.exe /configure /db $tempDb /cfg $tempInf /overwrite /areas USER_RIGHTS /log $tempLog | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "--- SECEDIT LOG ---"
+        if (Test-Path $tempLog) { Get-Content $tempLog | Write-Host }
+        Write-Host "--- GENERATED INF ---"
+        if (Test-Path $tempInf) { Get-Content $tempInf | Write-Host }
+        
+        Remove-Item $tempInf -Force -ErrorAction SilentlyContinue
+        Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
+        Remove-Item $tempLog -Force -ErrorAction SilentlyContinue
+        Write-Error "secedit configure failed with exit code $LASTEXITCODE"
+        exit 1
+    }
 }
-Remove-Item $tempSecPol -Force
-Remove-Item $tempDb -Force
+
+# 9. MOST IMPORTANT: verify the postcondition.
+$tempVerifyInf = Join-Path $env:TEMP ("agy-verify-" + [guid]::NewGuid() + ".inf")
+Invoke-NativeCommand { secedit.exe /export /cfg $tempVerifyInf /areas USER_RIGHTS }
+
+$verifyContent = Get-Content $tempVerifyInf -Encoding Unicode
+$verified = $false
+foreach ($line in $verifyContent) {
+    if ($line -match "^\s*SeBatchLogonRight\s*=") {
+        if ($line -match [regex]::Escape($workerSidTarget)) {
+            $verified = $true
+            break
+        }
+    }
+}
+
+Remove-Item $tempInf -Force -ErrorAction SilentlyContinue
+Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
+Remove-Item $tempLog -Force -ErrorAction SilentlyContinue
+Remove-Item $tempVerifyInf -Force -ErrorAction SilentlyContinue
+
+if (-not $verified) {
+    Write-Error "SeBatchLogonRight verification failed: SID $workerSidTarget not found in re-exported policy."
+    exit 1
+}
+Write-Host "SeBatchLogonRight successfully verified for $WorkerUser."
 
 
 # --- Directory & Base ACLs ---
