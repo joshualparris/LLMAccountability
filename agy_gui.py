@@ -3,20 +3,23 @@ from tkinter import ttk, messagebox
 import json
 import os
 
-LEDGER_PATH = "C:/ProgramData/AGYVerifier/protected_ledger.jsonl"
+import urllib.request
+import urllib.error
+
+SERVICE_URL = "http://127.0.0.1:8123/ledger"
 
 def load_ledger():
-    if not os.path.exists(LEDGER_PATH):
-        return []
-    records = []
     try:
-        with open(LEDGER_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    records.append(json.loads(line))
+        req = urllib.request.Request(SERVICE_URL)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = response.read()
+            return json.loads(data)
+    except urllib.error.URLError as e:
+        messagebox.showerror("Error", f"Could not connect to the protected service: {e}")
+        return []
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to load ledger (access denied?): {e}")
-    return records
+        messagebox.showerror("Error", f"Failed to load ledger: {e}")
+        return []
 
 class VerifierGUI:
     def __init__(self, root):

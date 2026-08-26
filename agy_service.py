@@ -87,6 +87,31 @@ def validate_ledger():
         if calculated_hash != expected_hash:
             raise RuntimeError(f"Ledger tampered or corrupted at line {i+1}!")
             
+        # Reconstruct expected cert ID
+        try:
+            ts = datetime.fromisoformat(record["timestamp"])
+            expected_cert_id = f"AGY-{ts.strftime('%Y%m%d')}-{calculated_hash[:8]}"
+            if record.get("certificate_id") != expected_cert_id:
+                raise RuntimeError(f"certificate_id mismatch at line {i+1}")
+        except ValueError:
+            raise RuntimeError(f"Invalid timestamp format at line {i+1}")
+            
+        # Verify Ed25519 Signature
+        sig_b64 = record.get("signature_ed25519")
+        if not sig_b64:
+            raise RuntimeError(f"Missing signature at line {i+1}")
+        try:
+            sig_bytes = base64.b64decode(sig_b64)
+            canonical_record_for_sig = dict(record)
+            del canonical_record_for_sig["signature_ed25519"]
+            
+            public_key.verify(
+                sig_bytes,
+                json.dumps(canonical_record_for_sig, sort_keys=True).encode("utf-8")
+            )
+        except Exception:
+            raise RuntimeError(f"Invalid cryptographic signature at line {i+1}")
+            
         prev_hash = expected_hash
 
 def get_last_hash() -> str:
@@ -128,6 +153,17 @@ def sign_record(record: dict) -> str:
     canonical_json = json.dumps(record, sort_keys=True).encode("utf-8")
     signature = private_key.sign(canonical_json)
     return base64.b64encode(signature).decode("utf-8")
+
+@app.get("/ledger")
+def get_ledger():
+    if not os.path.exists(LEDGER_PATH):
+        return []
+    records = []
+    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
 
 @app.post("/certify")
 def certify(req: ClaimRequest):

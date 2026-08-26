@@ -14,10 +14,19 @@ if (-not (Test-Path $ProtectedDir)) {
     New-Item -ItemType Directory -Path $ProtectedDir | Out-Null
 }
 
+Write-Host "Copying service runtime to protected directory..."
+# Prevent privilege escalation by ensuring SYSTEM only runs code from the protected directory
+Copy-Item -Path "$AppPath\agy_service.py" -Destination "$ProtectedDir\agy_service.py" -Force
+
 Write-Host "Locking down ACLs on $ProtectedDir..."
 # We want only SYSTEM and Administrators to have access.
 $Acl = Get-Acl $ProtectedDir
-$Acl.SetAccessRuleProtection($true, $false) # Disable inheritance, clear existing rules
+$Acl.SetAccessRuleProtection($true, $false) # Disable inheritance
+
+# Clear any explicit existing rules
+foreach ($rule in $Acl.Access) {
+    $Acl.RemoveAccessRule($rule) | Out-Null
+}
 
 $SystemAccess = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
 $AdminAccess = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
@@ -33,7 +42,8 @@ if ($existingTask) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-$Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "$AppPath\agy_service.py" -WorkingDirectory $AppPath
+# Execute the COPY of the script in the protected directory
+$Action = New-ScheduledTaskAction -Execute $PythonExe -Argument "$ProtectedDir\agy_service.py" -WorkingDirectory $ProtectedDir
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
