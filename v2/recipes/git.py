@@ -6,20 +6,23 @@ class GitPushRecipe(BaseRecipe):
     def verify(self, claim: Dict[str, Any], context: Dict[str, Any]) -> RecipeResult:
         repo_path = context.get("repo_path", ".")
         
-        # Route through the Protected Execution Broker
+        # Route through the SYSTEM Notary
         try:
             resp = requests.post(
-                "http://127.0.0.1:8124/execute",
+                "http://127.0.0.1:8123/v2/execute",
                 json={"claim": "pushed", "repo_path": repo_path},
                 timeout=30
             )
             
             if resp.status_code != 200:
-                return RecipeResult(Verdict.INCONCLUSIVE, {"error": resp.text}, "Broker execution failed")
+                return RecipeResult(Verdict.INCONCLUSIVE, {"error": resp.text}, "Notary execution failed")
                 
             data = resp.json()
             evidence = data.get("evidence", {})
-            signature = data.get("signature", "")
+            authenticated = data.get("authenticated", False)
+            
+            if not authenticated:
+                return RecipeResult(Verdict.FAIL, evidence, "Evidence rejected by SYSTEM notary")
             
             # Simple policy check for the pushed recipe:
             # We want local head == remote head == ls-remote sha
@@ -31,8 +34,6 @@ class GitPushRecipe(BaseRecipe):
                 return RecipeResult(Verdict.FAIL, evidence, "Missing Git state")
                 
             if local == remote and local == ls_remote:
-                # Store signature for attestation provenance
-                evidence["broker_signature"] = signature
                 return RecipeResult(Verdict.PASS, evidence, "Local branch perfectly synced with remote")
             else:
                 return RecipeResult(Verdict.FAIL, evidence, f"Unsynced: local={local}, remote={remote}, ls_remote={ls_remote}")

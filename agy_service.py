@@ -23,23 +23,26 @@ SECRET_PATH = os.path.join(PROTECTED_DIR, "worker_secret.key")
 WORKER_URL = "http://127.0.0.1:8124/execute"
 
 # Ensure keys exist
-if not os.path.exists(KEY_PATH):
-    private_key = ed25519.Ed25519PrivateKey.generate()
-    with open(KEY_PATH, "wb") as f:
-        f.write(private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        ))
-    public_key = private_key.public_key()
-    with open(PUB_KEY_PATH, "wb") as f:
-        f.write(public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ))
-else:
-    with open(KEY_PATH, "rb") as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=None)
+try:
+    if not os.path.exists(KEY_PATH):
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        with open(KEY_PATH, "wb") as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        public_key = private_key.public_key()
+        with open(PUB_KEY_PATH, "wb") as f:
+            f.write(public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ))
+    else:
+        with open(KEY_PATH, "rb") as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=None)
+except Exception:
+    private_key = None
 
 app = FastAPI(title="Antigravity Protected Verification Service")
 
@@ -252,6 +255,50 @@ def certify(req: ClaimRequest):
     record["signature_ed25519"] = sign_record(record)
     append_ledger(record)
     return record
+
+def pae(payload_type: str, payload: str) -> bytes:
+    # DSSE Pre-Authentication Encoding (PAE)
+    # PAE(type, payload) = "DSSEv1" + " " + len(type) + " " + type + " " + len(payload) + " " + payload
+    
+    # payload_type and payload are expected to be strings (payload is base64 string typically, but PAE operates on raw bytes of the strings)
+    type_bytes = payload_type.encode('utf-8')
+    payload_bytes = payload.encode('utf-8')
+    
+    pae_str = b"DSSEv1 " + str(len(type_bytes)).encode('utf-8') + b" " + type_bytes + b" " + str(len(payload_bytes)).encode('utf-8') + b" " + payload_bytes
+    return pae_str
+
+class V2ExecuteRequest(BaseModel):
+    claim: str
+    repo_path: str = "."
+    profile: Optional[str] = None
+
+class V2SignRequest(BaseModel):
+    payloadType: str
+    payload: str
+
+@app.post("/v2/execute")
+def v2_execute(req: V2ExecuteRequest):
+    # Route to worker
+    resp = requests.post(WORKER_URL, json=req.dict(), timeout=30)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail="Worker execution failed")
+        
+    worker_resp = resp.json()
+    evidence = worker_resp.get("evidence", {})
+    sig = worker_resp.get("signature")
+    
+    if not sig or not verify_worker_signature(evidence, sig):
+        raise HTTPException(status_code=403, detail="Worker signature invalid or missing")
+        
+    return {"evidence": evidence, "authenticated": True}
+
+@app.post("/v2/sign")
+def v2_sign(req: V2SignRequest):
+    # WARNING: This acts as a signing oracle for V2 during scaffold transition.
+    # In full V2, the Notary will re-evaluate policy before signing.
+    encoded_pae = pae(req.payloadType, req.payload)
+    signature = private_key.sign(encoded_pae)
+    return {"signature": base64.b64encode(signature).decode("utf-8")}
 
 if __name__ == "__main__":
     print(f"Starting Antigravity Protected Service (v1.5) on localhost:8123...")

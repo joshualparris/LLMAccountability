@@ -53,3 +53,31 @@ def test_policy_partial_maps_to_inconclusive():
     assert report["final_verdict"] == Verdict.INCONCLUSIVE
     inconclusive_types = [c["type"] for c in report["inconclusive_claims"]]
     assert "no-secrets" in inconclusive_types
+
+import hashlib
+from v2.attestations.intoto import InTotoAttestation
+import base64
+
+def test_claim_extractor_deterministic_id():
+    claims1 = ClaimExtractor.extract("tests pass", report_id="report_A")
+    claims2 = ClaimExtractor.extract("tests pass", report_id="report_B")
+    assert claims1[0]["id"] != claims2[0]["id"]
+    claims3 = ClaimExtractor.extract("tests pass", report_id="report_A")
+    assert claims1[0]["id"] == claims3[0]["id"]
+
+def test_dsse_pae():
+    import sys
+    import os
+    sys.path.append(os.path.abspath("."))
+    from agy_service import pae
+    
+    result = pae("application/vnd.in-toto+json", "helloworld")
+    expected = b"DSSEv1 28 application/vnd.in-toto+json 10 helloworld"
+    assert result == expected
+
+def test_broker_injection_mitigation():
+    with open("agy_worker.py", "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "{cwd}" not in content
+    assert "$TargetCwd" in content
+    assert "-TargetCwd" in content

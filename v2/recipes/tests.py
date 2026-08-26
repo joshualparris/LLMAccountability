@@ -7,28 +7,29 @@ class TestsPassRecipe(BaseRecipe):
         repo_path = context.get("repo_path", ".")
         profile = context.get("profile", "python-full")
         
-        # Route through the Protected Execution Broker
+        # Route through the SYSTEM Notary
         try:
             resp = requests.post(
-                "http://127.0.0.1:8124/execute",
+                "http://127.0.0.1:8123/v2/execute",
                 json={"claim": "tests-pass", "repo_path": repo_path, "profile": profile},
                 timeout=60
             )
             
             if resp.status_code != 200:
-                return RecipeResult(Verdict.INCONCLUSIVE, {"error": resp.text}, "Broker execution failed")
+                return RecipeResult(Verdict.INCONCLUSIVE, {"error": resp.text}, "Notary execution failed")
                 
             data = resp.json()
             evidence = data.get("evidence", {})
-            signature = data.get("signature", "")
+            authenticated = data.get("authenticated", False)
+            
+            if not authenticated:
+                return RecipeResult(Verdict.FAIL, evidence, "Evidence rejected by SYSTEM notary")
             
             exit_code = evidence.get("exit_code")
             
             if exit_code is None:
                 return RecipeResult(Verdict.INCONCLUSIVE, evidence, "No exit code reported by runner")
                 
-            evidence["broker_signature"] = signature
-            
             if exit_code == 0:
                 return RecipeResult(Verdict.PASS, evidence, "Test command returned exit code 0")
             else:

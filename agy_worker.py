@@ -48,44 +48,54 @@ def run_as_runner(cmd: list, cwd: str) -> tuple[int, str]:
         
     args_str = " ".join(f'"{arg}"' if ' ' in arg else arg for arg in cmd[1:])
     
-    script = f"""
+    script = """
+param(
+    [string]$TargetCmd,
+    [string]$TargetArgs,
+    [string]$TargetCwd
+)
 $ErrorActionPreference = "Stop"
-$secStr = ConvertTo-SecureString '{pwd}' -AsPlainText -Force
+$secStr = ConvertTo-SecureString $env:AGY_RUNNER_PWD -AsPlainText -Force
 $psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = "{cmd[0]}"
-$psi.Arguments = '{args_str}'
+$psi.FileName = $TargetCmd
+$psi.Arguments = $TargetArgs
 $psi.UserName = "AGYRunner"
 $psi.Password = $secStr
 $psi.UseShellExecute = $false
 $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
-$psi.WorkingDirectory = "{cwd}"
+$psi.WorkingDirectory = $TargetCwd
 $psi.CreateNoWindow = $true
 
-try {{
+try {
     $p = [System.Diagnostics.Process]::Start($psi)
     $p.WaitForExit()
     $stdout = $p.StandardOutput.ReadToEnd()
     $stderr = $p.StandardError.ReadToEnd()
     
-    $result = @{{
+    $result = @{
         ExitCode = $p.ExitCode
         Stdout = $stdout
         Stderr = $stderr
-    }}
+    }
     $result | ConvertTo-Json -Compress
-}} catch {{
-    $err = @{{ ExitCode = -1; Stdout = ""; Stderr = $_.Exception.Message }}
+} catch {
+    $err = @{ ExitCode = -1; Stdout = ""; Stderr = $_.Exception.Message }
     $err | ConvertTo-Json -Compress
-}}
+}
 """
     with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
         f.write(script)
         script_path = f.name
         
     try:
-        res = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path], 
-                             capture_output=True, text=True, check=True)
+        env = os.environ.copy()
+        env["AGY_RUNNER_PWD"] = pwd
+        res = subprocess.run(
+            ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path, 
+             "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", cwd], 
+            capture_output=True, text=True, check=True, env=env
+        )
         out_json = json.loads(res.stdout.strip())
         return out_json.get("ExitCode", -1), out_json.get("Stdout", "")
     except Exception as e:
