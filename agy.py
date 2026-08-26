@@ -7,6 +7,9 @@ from v2.policy.engine import PolicyEngine
 from v2.recipes.base import Verdict, RecipeResult
 from v2.attestations.intoto import InTotoAttestation
 
+from v2.recipes.git import GitPushRecipe
+from v2.recipes.tests import TestsPassRecipe
+
 def main():
     parser = argparse.ArgumentParser(description="LLMAccountability V2 CLI")
     subparsers = parser.add_subparsers(dest="command")
@@ -14,6 +17,8 @@ def main():
     audit_parser = subparsers.add_parser("audit-report")
     audit_parser.add_argument("file", help="Markdown file to audit")
     audit_parser.add_argument("--enforce", action="store_true")
+    audit_parser.add_argument("--repo-path", default=".", help="Repository path to verify against")
+    audit_parser.add_argument("--test-profile", default="python-full", help="Test profile to run")
     
     args = parser.parse_args()
     
@@ -30,16 +35,19 @@ def main():
         print(f"{'Claim':<40} {'Verdict'}")
         print("-" * 60)
         
-        # Mocking verification execution for the scaffold
+        # Route claims to actual deterministic recipes
         results = {}
+        context = {"repo_path": args.repo_path, "profile": args.test_profile}
+        
         for c in claims:
-            # We would route to actual recipes here via agy_worker
-            # For now, default everything to INCONCLUSIVE unless we write a real recipe
-            v = Verdict.INCONCLUSIVE
-            if c["type"] == "tests-pass" or c["type"] == "pushed":
-                v = Verdict.PASS
-            results[c["id"]] = RecipeResult(v, {}, "Mocked result")
-            print(f"{c['type']:<40} {v.value}")
+            if c["type"] == "pushed":
+                results[c["id"]] = GitPushRecipe().verify(c, context)
+            elif c["type"] == "tests-pass":
+                results[c["id"]] = TestsPassRecipe().verify(c, context)
+            else:
+                results[c["id"]] = RecipeResult(Verdict.INCONCLUSIVE, {}, "Recipe not implemented yet")
+                
+            print(f"{c['type']:<40} {results[c['id']].verdict.value}")
             
         report = PolicyEngine.evaluate(claims, results)
         print(f"\nFINAL REPORT: {report['final_verdict'].value}")
