@@ -1,25 +1,26 @@
 import os
 import json
-import hashlib
-import subprocess
-import psutil
-import requests
-from datetime import datetime, timezone
 import base64
+import hashlib
+import hmac
+import subprocess
+from datetime import datetime, timezone
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+import requests
 import uvicorn
+
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 
-# Protected paths
-PROTECTED_DIR = os.path.abspath("C:/ProgramData/AGYVerifier")
+PROTECTED_DIR = "C:/ProgramData/AGYVerifier"
 os.makedirs(PROTECTED_DIR, exist_ok=True)
-
-LEDGER_PATH = os.path.join(PROTECTED_DIR, "protected_ledger.jsonl")
 KEY_PATH = os.path.join(PROTECTED_DIR, "private.pem")
 PUB_KEY_PATH = os.path.join(PROTECTED_DIR, "public.pem")
+LEDGER_PATH = os.path.join(PROTECTED_DIR, "protected_ledger.jsonl")
+SECRET_PATH = os.path.join(PROTECTED_DIR, "worker_secret.key")
+WORKER_URL = "http://127.0.0.1:8124/execute"
 
 # Ensure keys exist
 if not os.path.exists(KEY_PATH):
@@ -41,9 +42,6 @@ else:
         private_key = serialization.load_pem_private_key(f.read(), password=None)
 
 app = FastAPI(title="Antigravity Protected Verification Service")
-
-SECRET_PATH = os.path.join(PROTECTED_DIR, "worker_secret.key")
-WORKER_URL = "http://127.0.0.1:8124/execute"
 
 def get_secret():
     if not os.path.exists(SECRET_PATH):
@@ -68,6 +66,103 @@ class ClaimRequest(BaseModel):
     url: Optional[str] = None
     expected_status: int = 200
     expected_content: Optional[str] = None
+
+def validate_ledger():
+    if not os.path.exists(LEDGER_PATH):
+        return
+    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if not lines:
+        return
+        
+    prev_hash = "0" * 64
+    for i, line in enumerate(lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Audit log corrupt at line {i+1}")
+            
+        expected_hash = record.get("hash")
+        if record.get("previous_hash") != prev_hash:
+            raise RuntimeError(f"previous_hash mismatch at line {i+1}")
+            
+        temp_record = {
+            "timestamp": record["timestamp"],
+            "claim": record["claim"],
+            "status": record["status"],
+            "evidence": record["evidence"],
+            "previous_hash": prev_hash
+        }
+        if "error" in record:
+            temp_record["error"] = record["error"]
+            
+        canonical_json = json.dumps(temp_record, sort_keys=True)
+        calculated_hash = hashlib.sha256((prev_hash + canonical_json).encode("utf-8")).hexdigest()
+        
+        if calculated_hash != expected_hash:
+            raise RuntimeError(f"Ledger tampered or corrupted at line {i+1}!")
+            
+        # Reconstruct expected cert ID
+        try:
+            ts = datetime.fromisoformat(record["timestamp"])
+            expected_cert_id = f"AGY-{ts.strftime('%Y%m%d')}-{calculated_hash[:8]}"
+            if record.get("certificate_id") != expected_cert_id:
+                raise RuntimeError(f"certificate_id mismatch at line {i+1}")
+        except ValueError:
+            raise RuntimeError(f"Invalid timestamp format at line {i+1}")
+            
+        # Verify Ed25519 Signature
+        sig_b64 = record.get("signature_ed25519")
+        if not sig_b64:
+            raise RuntimeError(f"Missing signature at line {i+1}")
+        try:
+            sig_bytes = base64.b64decode(sig_b64)
+            canonical_record_for_sig = dict(record)
+            del canonical_record_for_sig["signature_ed25519"]
+            
+            with open(PUB_KEY_PATH, "rb") as f:
+                pub_key = serialization.load_pem_public_key(f.read(), password=None)
+                
+            pub_key.verify(
+                sig_bytes,
+                json.dumps(canonical_record_for_sig, sort_keys=True).encode("utf-8")
+            )
+        except Exception:
+            raise RuntimeError(f"Invalid cryptographic signature at line {i+1}")
+            
+        prev_hash = expected_hash
+
+def get_last_hash() -> str:
+    if not os.path.exists(LEDGER_PATH):
+        return "0" * 64
+    try:
+        with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            if not lines:
+                return "0" * 64
+            return json.loads(lines[-1])["hash"]
+    except Exception as e:
+        raise RuntimeError(f"Audit log is corrupt or unreadable: {e}")
+
+def append_ledger(record: dict):
+    with open(LEDGER_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+def sign_record(record: dict) -> str:
+    canonical_json = json.dumps(record, sort_keys=True).encode("utf-8")
+    signature = private_key.sign(canonical_json)
+    return base64.b64encode(signature).decode("utf-8")
+
+@app.get("/ledger")
+def get_ledger():
+    if not os.path.exists(LEDGER_PATH):
+        return []
+    records = []
+    with open(LEDGER_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
 
 @app.post("/certify")
 def certify(req: ClaimRequest):
@@ -159,7 +254,5 @@ def certify(req: ClaimRequest):
     return record
 
 if __name__ == "__main__":
-    print(f"Starting Antigravity Protected Service (v1) on localhost:8123...")
-    print(f"Ledger Path: {LEDGER_PATH}")
-    print(f"Public Key Path: {PUB_KEY_PATH}")
+    print(f"Starting Antigravity Protected Service (v1.5) on localhost:8123...")
     uvicorn.run(app, host="127.0.0.1", port=8123, log_level="warning")

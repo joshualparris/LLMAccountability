@@ -1,9 +1,3 @@
-# install_service.ps1
-# This script sets up the true Trust Boundary.
-# It registers the AGY Service to run as SYSTEM, and locks down the ProgramData directory.
-
-$ErrorActionPreference = "Stop"
-
 $AppPath = "C:\dev\LLMAccountabilityApp"
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
 
@@ -18,9 +12,12 @@ if (-not (Test-Path $ServiceExe)) { Write-Error "Missing agy_service.exe"; exit 
 if (-not (Test-Path $WorkerExe)) { Write-Error "Missing agy_worker.exe"; exit 1 }
 
 Write-Host "Creating local worker account ($WorkerUser)..."
+$PlainTextPassword = ([guid]::NewGuid().ToString() + "A1!")
+$SecurePassword = ConvertTo-SecureString -String $PlainTextPassword -AsPlainText -Force
 if (-not (Get-LocalUser -Name $WorkerUser -ErrorAction SilentlyContinue)) {
-    $Password = ConvertTo-SecureString -String ([guid]::NewGuid().ToString() + "A1!") -AsPlainText -Force
-    New-LocalUser -Name $WorkerUser -Password $Password -PasswordNeverExpires -Description "Unprivileged verification worker" | Out-Null
+    New-LocalUser -Name $WorkerUser -Password $SecurePassword -PasswordNeverExpires -Description "Unprivileged verification worker" | Out-Null
+} else {
+    Set-LocalUser -Name $WorkerUser -Password $SecurePassword
 }
 
 Write-Host "Creating protected directory..."
@@ -31,23 +28,41 @@ if (Test-Path "$ProtectedDir\private.pem") { Remove-Item "$ProtectedDir\private.
 if (Test-Path "$ProtectedDir\public.pem") { Remove-Item "$ProtectedDir\public.pem" -Force }
 if (Test-Path "$ProtectedDir\worker_secret.key") { Remove-Item "$ProtectedDir\worker_secret.key" -Force }
 
+Write-Host "Generating new HMAC worker secret..."
+$SecretBytes = New-Object byte[] 32
+(New-Object System.Security.Cryptography.RNGCryptoServiceProvider).GetBytes($SecretBytes)
+[System.IO.File]::WriteAllBytes("$ProtectedDir\worker_secret.key", $SecretBytes)
+
 Write-Host "Copying compiled executables..."
 Copy-Item -Path $ServiceExe -Destination "$ProtectedDir\agy_service.exe" -Force
 Copy-Item -Path $WorkerExe -Destination "$ProtectedDir\agy_worker.exe" -Force
 
-Write-Host "Locking down ACLs on $ProtectedDir..."
-$Acl = Get-Acl $ProtectedDir
-$Acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in $Acl.Access) { $Acl.RemoveAccessRule($rule) | Out-Null }
+# --- ACL Setup ---
+Write-Host "Locking down ACLs..."
+$SystemAccess = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "None", "None", "Allow")
+$WorkerAccess = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "None", "None", "Allow")
 
-$SystemAccess = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
-$AdminAccess = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
-$WorkerAccess = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+# 1. Directory itself (List only for SYSTEM, so no inherited access)
+$DirAcl = Get-Acl $ProtectedDir
+$DirAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in $DirAcl.Access) { $DirAcl.RemoveAccessRule($rule) | Out-Null }
+$DirAcl.AddAccessRule(New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))
+Set-Acl -Path $ProtectedDir -AclObject $DirAcl
 
-$Acl.AddAccessRule($SystemAccess)
-$Acl.AddAccessRule($AdminAccess)
-$Acl.AddAccessRule($WorkerAccess)
-Set-Acl -Path $ProtectedDir -AclObject $Acl
+# Ensure files inherit from the strictly locked directory, then add specific worker access
+function Grant-WorkerRead($FilePath) {
+    if (Test-Path $FilePath) {
+        $FileAcl = Get-Acl $FilePath
+        $FileAcl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in $FileAcl.Access) { $FileAcl.RemoveAccessRule($rule) | Out-Null }
+        $FileAcl.AddAccessRule($SystemAccess)
+        $FileAcl.AddAccessRule($WorkerAccess)
+        Set-Acl -Path $FilePath -AclObject $FileAcl
+    }
+}
+
+Grant-WorkerRead "$ProtectedDir\agy_worker.exe"
+Grant-WorkerRead "$ProtectedDir\worker_secret.key"
 
 Write-Host "Registering SYSTEM Notary Task..."
 if (Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false }
@@ -61,10 +76,14 @@ if (Get-ScheduledTask -TaskName $WorkerName -ErrorAction SilentlyContinue) { Unr
 $ActionWkr = New-ScheduledTaskAction -Execute "$ProtectedDir\agy_worker.exe" -WorkingDirectory $ProtectedDir
 $TriggerWkr = New-ScheduledTaskTrigger -AtStartup
 $PrincipalWkr = New-ScheduledTaskPrincipal -UserId $WorkerUser -LogonType Password
-Register-ScheduledTask -TaskName $WorkerName -Action $ActionWkr -Trigger $TriggerWkr -Principal $PrincipalWkr -Description "Unprivileged Worker Service" | Out-Null
+Register-ScheduledTask -TaskName $WorkerName -Action $ActionWkr -Trigger $TriggerWkr -Principal $PrincipalWkr -Password $PlainTextPassword -Description "Unprivileged Worker Service" | Out-Null
+
+Write-Host "Recording Installation Hashes..."
+Write-Host "agy_service.exe SHA256: $((Get-FileHash "$ProtectedDir\agy_service.exe" -Algorithm SHA256).Hash)"
+Write-Host "agy_worker.exe SHA256: $((Get-FileHash "$ProtectedDir\agy_worker.exe" -Algorithm SHA256).Hash)"
 
 Write-Host "Starting the services..."
 Start-ScheduledTask -TaskName $ServiceName
 Start-ScheduledTask -TaskName $WorkerName
 
-Write-Host "Trust Boundary established. The service is now running as SYSTEM, and the ledger/keys are protected from standard user tampering."
+Write-Host "Trust Boundary established securely."
