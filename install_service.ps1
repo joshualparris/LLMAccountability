@@ -290,6 +290,18 @@ Set-StrictAcl "worker_secret.key" $WorkerRead
 Set-StrictAcl "runner_pwd.txt" $WorkerRead
 Set-StrictAcl "agy_worker.exe" $WorkerAccess
 
+# --- Workspace Permissions for AGYRunner ---
+$WorkspaceDir = (Get-Item $RepoRoot).Parent.FullName
+Write-Host "Configuring AGYRunner read-only access to workspace: $WorkspaceDir"
+if (Test-Path $WorkspaceDir) {
+    $WorkspaceAcl = Get-Acl $WorkspaceDir
+    $RunnerRead = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $RunnerDenyWrite = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "Write", "ContainerInherit,ObjectInherit", "None", "Deny")
+    $WorkspaceAcl.AddAccessRule($RunnerDenyWrite)
+    $WorkspaceAcl.AddAccessRule($RunnerRead)
+    Set-Acl -Path $WorkspaceDir -AclObject $WorkspaceAcl
+}
+
 # --- Scheduled Tasks Registration ---
 Write-Host "Registering SYSTEM Notary Task..."
 if (Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false }
