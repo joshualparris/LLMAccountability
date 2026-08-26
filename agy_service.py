@@ -38,6 +38,10 @@ try:
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo
             ))
+        try:
+            subprocess.run(["icacls", PUB_KEY_PATH, "/grant", "BUILTIN\\Users:(R)"], check=False)
+        except Exception:
+            pass
     else:
         with open(KEY_PATH, "rb") as f:
             private_key = serialization.load_pem_private_key(f.read(), password=None)
