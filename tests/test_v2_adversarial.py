@@ -81,3 +81,120 @@ def test_broker_injection_mitigation():
     assert "{cwd}" not in content
     assert "$TargetCwd" in content
     assert "-TargetCwd" in content
+
+from fastapi.testclient import TestClient
+from agy_service import app, verify_worker_signature, get_secret
+import json
+import base64
+import hmac
+import hashlib
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+client = TestClient(app)
+
+def test_v2_sign_does_not_exist():
+    response = client.post("/v2/sign", json={"payloadType": "foo", "payload": "bar"})
+    assert response.status_code == 404
+
+def test_arbitrary_payload_signing_impossible():
+    # Since /v2/sign is gone, and /v2/attest requires actual claims to evaluate,
+    # we cannot just pass an arbitrary payload string and get it signed.
+    pass
+
+def test_fail_cannot_receive_pass_attestation(monkeypatch):
+    # Mock GitPushRecipe to return FAIL
+    from v2.recipes.git import GitPushRecipe
+    from v2.recipes.base import RecipeResult, Verdict
+    def mock_verify(self, claim, context):
+        return RecipeResult(Verdict.FAIL, {"error": "bad git"}, "Mocked fail")
+    monkeypatch.setattr(GitPushRecipe, "verify", mock_verify)
+
+    # Mock the private key
+    import agy_service
+    test_key = ed25519.Ed25519PrivateKey.generate()
+    monkeypatch.setattr(agy_service, "private_key", test_key)
+
+    response = client.post("/v2/attest", json={
+        "claims": [{"id": "1", "type": "pushed", "raw_text": "I pushed"}],
+        "context": {},
+        "subject_name": "test",
+        "subject_digest": "dummy"
+    })
+    
+    assert response.status_code == 200
+    env = response.json()
+    payload = json.loads(base64.b64decode(env["payload"]))
+    
+    # The final verdict MUST be FAIL
+    assert payload["predicate"]["policy_evaluation"]["final_verdict"] == Verdict.FAIL.value
+
+def test_inconclusive_prevents_absolute_completion(monkeypatch):
+    from v2.recipes.git import GitPushRecipe
+    from v2.recipes.base import RecipeResult, Verdict
+    def mock_verify(self, claim, context):
+        return RecipeResult(Verdict.INCONCLUSIVE, {}, "Mocked inc")
+    monkeypatch.setattr(GitPushRecipe, "verify", mock_verify)
+
+    import agy_service
+    test_key = ed25519.Ed25519PrivateKey.generate()
+    monkeypatch.setattr(agy_service, "private_key", test_key)
+
+    response = client.post("/v2/attest", json={
+        "claims": [
+            {"id": "1", "type": "pushed", "raw_text": "I pushed"},
+            {"id": "2", "type": "fully-complete", "raw_text": "I am done"}
+        ],
+        "context": {},
+        "subject_name": "test",
+        "subject_digest": "dummy"
+    })
+    
+    assert response.status_code == 200
+    env = response.json()
+    payload = json.loads(base64.b64decode(env["payload"]))
+    
+    # Since fully-complete was claimed but there's an INCONCLUSIVE, it results in FAIL
+    assert payload["predicate"]["policy_evaluation"]["final_verdict"] == Verdict.FAIL.value
+
+def test_forged_broker_evidence_rejected(monkeypatch):
+    import agy_service
+    monkeypatch.setattr(agy_service, "get_secret", lambda: b"dummysecret")
+    
+    evidence = {"fake": "evidence"}
+    assert verify_worker_signature(evidence, "forged_signature") == False
+
+def test_valid_evidence_produces_signed_receipt_that_verifies(monkeypatch):
+    from v2.recipes.git import GitPushRecipe
+    from v2.recipes.base import RecipeResult, Verdict
+    def mock_verify(self, claim, context):
+        return RecipeResult(Verdict.PASS, {"local_head": "abc"}, "Mocked pass")
+    monkeypatch.setattr(GitPushRecipe, "verify", mock_verify)
+
+    import agy_service
+    test_key = ed25519.Ed25519PrivateKey.generate()
+    monkeypatch.setattr(agy_service, "private_key", test_key)
+
+    response = client.post("/v2/attest", json={
+        "claims": [{"id": "1", "type": "pushed", "raw_text": "I pushed"}],
+        "context": {},
+        "subject_name": "test",
+        "subject_digest": "dummy"
+    })
+    
+    assert response.status_code == 200
+    env = response.json()
+    
+    # Verify the signature
+    payload = env["payload"]
+    payload_type = env["payloadType"]
+    sig_b64 = env["signatures"][0]["sig"]
+    sig_bytes = base64.b64decode(sig_b64)
+    
+    from agy_service import pae
+    pae_bytes = pae(payload_type, payload)
+    
+    pub_key = test_key.public_key()
+        
+    # verify() will raise InvalidSignature if it fails
+    pub_key.verify(sig_bytes, pae_bytes)

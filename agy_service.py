@@ -292,13 +292,54 @@ def v2_execute(req: V2ExecuteRequest):
         
     return {"evidence": evidence, "authenticated": True}
 
-@app.post("/v2/sign")
-def v2_sign(req: V2SignRequest):
-    # WARNING: This acts as a signing oracle for V2 during scaffold transition.
-    # In full V2, the Notary will re-evaluate policy before signing.
-    encoded_pae = pae(req.payloadType, req.payload)
+from v2.policy.engine import PolicyEngine
+from v2.recipes.base import Verdict, RecipeResult
+from v2.attestations.intoto import InTotoAttestation
+
+class V2AttestRequest(BaseModel):
+    claims: list
+    context: dict
+    subject_name: str
+    subject_digest: str
+
+@app.post("/v2/attest")
+def v2_attest(req: V2AttestRequest):
+    # To prevent acting as a signing oracle, the Notary MUST independently
+    # execute recipes, authenticate evidence, and evaluate policy.
+    
+    # We must import the recipes here to avoid circular dependencies if imported at top-level
+    from v2.recipes.git import GitPushRecipe
+    from v2.recipes.tests import TestsPassRecipe
+    
+    results = {}
+    for c in req.claims:
+        if c["type"] == "pushed":
+            results[c["id"]] = GitPushRecipe().verify(c, req.context)
+        elif c["type"] == "tests-pass":
+            results[c["id"]] = TestsPassRecipe().verify(c, req.context)
+        else:
+            results[c["id"]] = RecipeResult(Verdict.INCONCLUSIVE, {}, "Recipe not implemented yet")
+            
+    report = PolicyEngine.evaluate(req.claims, results)
+    
+    # Generate the unsigned in-toto statement
+    env = InTotoAttestation.create(
+        subject_name=req.subject_name,
+        subject_digest=req.subject_digest,
+        claims=req.claims,
+        results=results,
+        policy_report=report
+    )
+    
+    # Generate true DSSE signature
+    encoded_pae = pae(env["payloadType"], env["payload"])
     signature = private_key.sign(encoded_pae)
-    return {"signature": base64.b64encode(signature).decode("utf-8")}
+    env["signatures"].append({
+        "keyid": "agy-ed25519-notary",
+        "sig": base64.b64encode(signature).decode("utf-8")
+    })
+    
+    return env
 
 if __name__ == "__main__":
     print(f"Starting Antigravity Protected Service (v1.5) on localhost:8123...")
