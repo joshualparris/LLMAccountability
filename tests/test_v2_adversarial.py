@@ -249,3 +249,9 @@ def test_installer_no_invalid_parameters():
     with open("install_service.ps1", "r", encoding="utf-8") as f:
         content = f.read()
     assert "-AllowDemandStart" not in content
+
+def test_no_secedit_configure():
+    with open("install_service.ps1", "r", encoding="utf-8") as f:
+        content = f.read().lower()
+    assert "secedit.exe /configure" not in content
+    assert "secedit /configure" not in content

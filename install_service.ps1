@@ -1,12 +1,185 @@
 $ErrorActionPreference = "Stop"
 
-function Invoke-NativeCommand {
-    param([scriptblock]$Command)
-    & $Command
-    if ($LASTEXITCODE -ne 0) {
-        throw "Native command failed with exit code $($LASTEXITCODE): $($Command.ToString())"
+function Invoke-NativeProcessWithTimeout {
+    param(
+        [string]$FilePath, 
+        [string[]]$ArgumentList, 
+        [int]$TimeoutSeconds = 30
+    )
+    $procInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $procInfo.FileName = $FilePath
+    $procInfo.Arguments = $ArgumentList -join ' '
+    $procInfo.UseShellExecute = $false
+    $procInfo.CreateNoWindow = $true
+    
+    $process = [System.Diagnostics.Process]::Start($procInfo)
+    $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+    
+    if (-not $exited) {
+        $process.Kill()
+        throw "Process $FilePath timed out after $TimeoutSeconds seconds."
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "Process $FilePath exited with code $($process.ExitCode)."
     }
 }
+
+# --- BEGIN LSA HELPER ---
+$csharp = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.ComponentModel;
+
+public class LsaWrapper {
+    [DllImport("advapi32.dll", PreserveSig = true, CharSet = CharSet.Unicode)]
+    public static extern uint LsaOpenPolicy(IntPtr SystemName, ref LSA_OBJECT_ATTRIBUTES ObjectAttributes, int AccessMask, out IntPtr PolicyHandle);
+
+    [DllImport("advapi32.dll", PreserveSig = true, CharSet = CharSet.Unicode)]
+    public static extern uint LsaAddAccountRights(IntPtr PolicyHandle, byte[] AccountSid, LSA_UNICODE_STRING[] UserRights, int CountOfRights);
+
+    [DllImport("advapi32.dll", PreserveSig = true, CharSet = CharSet.Unicode)]
+    public static extern uint LsaRemoveAccountRights(IntPtr PolicyHandle, byte[] AccountSid, bool AllRights, LSA_UNICODE_STRING[] UserRights, int CountOfRights);
+
+    [DllImport("advapi32.dll", PreserveSig = true, CharSet = CharSet.Unicode)]
+    public static extern uint LsaEnumerateAccountRights(IntPtr PolicyHandle, byte[] AccountSid, out IntPtr UserRights, out int CountOfRights);
+
+    [DllImport("advapi32.dll")]
+    public static extern int LsaNtStatusToWinError(uint status);
+
+    [DllImport("advapi32.dll")]
+    public static extern uint LsaClose(IntPtr ObjectHandle);
+
+    [DllImport("advapi32.dll")]
+    public static extern uint LsaFreeMemory(IntPtr Buffer);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LSA_OBJECT_ATTRIBUTES {
+        public int Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public int Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct LSA_UNICODE_STRING {
+        public ushort Length;
+        public ushort MaximumLength;
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string Buffer;
+    }
+
+    const int POLICY_LOOKUP_NAMES = 0x00000800;
+    const int POLICY_CREATE_ACCOUNT = 0x00000010;
+    const int POLICY_VIEW_LOCAL_INFORMATION = 0x00000001;
+
+    public static void GrantRight(SecurityIdentifier sid, string right) {
+        IntPtr policyHandle = IntPtr.Zero;
+        try {
+            LSA_OBJECT_ATTRIBUTES attrs = new LSA_OBJECT_ATTRIBUTES();
+            attrs.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+            
+            uint status = LsaOpenPolicy(IntPtr.Zero, ref attrs, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, out policyHandle);
+            if (status != 0) throw new Win32Exception(LsaNtStatusToWinError(status));
+
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+
+            LSA_UNICODE_STRING[] rights = new LSA_UNICODE_STRING[1];
+            rights[0] = new LSA_UNICODE_STRING();
+            rights[0].Buffer = right;
+            rights[0].Length = (ushort)(right.Length * 2);
+            rights[0].MaximumLength = (ushort)((right.Length + 1) * 2);
+
+            status = LsaAddAccountRights(policyHandle, sidBytes, rights, 1);
+            if (status != 0) throw new Win32Exception(LsaNtStatusToWinError(status));
+        } finally {
+            if (policyHandle != IntPtr.Zero) LsaClose(policyHandle);
+        }
+    }
+
+    public static void RevokeRight(SecurityIdentifier sid, string right) {
+        IntPtr policyHandle = IntPtr.Zero;
+        try {
+            LSA_OBJECT_ATTRIBUTES attrs = new LSA_OBJECT_ATTRIBUTES();
+            attrs.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+            
+            uint status = LsaOpenPolicy(IntPtr.Zero, ref attrs, POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES, out policyHandle);
+            if (status != 0) throw new Win32Exception(LsaNtStatusToWinError(status));
+
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+
+            LSA_UNICODE_STRING[] rights = new LSA_UNICODE_STRING[1];
+            rights[0] = new LSA_UNICODE_STRING();
+            rights[0].Buffer = right;
+            rights[0].Length = (ushort)(right.Length * 2);
+            rights[0].MaximumLength = (ushort)((right.Length + 1) * 2);
+
+            status = LsaRemoveAccountRights(policyHandle, sidBytes, false, rights, 1);
+            if (status != 0) {
+                int err = LsaNtStatusToWinError(status);
+                if (err != 2) throw new Win32Exception(err);
+            }
+        } finally {
+            if (policyHandle != IntPtr.Zero) LsaClose(policyHandle);
+        }
+    }
+
+    public static bool HasRight(SecurityIdentifier sid, string right) {
+        IntPtr policyHandle = IntPtr.Zero;
+        IntPtr userRightsPtr = IntPtr.Zero;
+        try {
+            LSA_OBJECT_ATTRIBUTES attrs = new LSA_OBJECT_ATTRIBUTES();
+            attrs.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+            
+            uint status = LsaOpenPolicy(IntPtr.Zero, ref attrs, POLICY_VIEW_LOCAL_INFORMATION | POLICY_LOOKUP_NAMES, out policyHandle);
+            if (status != 0) throw new Win32Exception(LsaNtStatusToWinError(status));
+
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+
+            int count = 0;
+            status = LsaEnumerateAccountRights(policyHandle, sidBytes, out userRightsPtr, out count);
+            if (status != 0) {
+                int err = LsaNtStatusToWinError(status);
+                if (err == 2) return false;
+                throw new Win32Exception(err);
+            }
+
+            IntPtr current = userRightsPtr;
+            for (int i = 0; i < count; i++) {
+                LSA_UNICODE_STRING lsaStr = (LSA_UNICODE_STRING)Marshal.PtrToStructure(current, typeof(LSA_UNICODE_STRING));
+                if (string.Equals(lsaStr.Buffer, right, StringComparison.OrdinalIgnoreCase)) return true;
+                current = (IntPtr)((long)current + Marshal.SizeOf(typeof(LSA_UNICODE_STRING)));
+            }
+            return false;
+        } finally {
+            if (userRightsPtr != IntPtr.Zero) LsaFreeMemory(userRightsPtr);
+            if (policyHandle != IntPtr.Zero) LsaClose(policyHandle);
+        }
+    }
+}
+'@
+Add-Type -TypeDefinition $csharp
+
+function Grant-LsaRight {
+    param([string]$AccountName, [string]$Right)
+    $sid = (New-Object System.Security.Principal.NTAccount($AccountName)).Translate([System.Security.Principal.SecurityIdentifier])
+    
+    if ([LsaWrapper]::HasRight($sid, "SeDenyBatchLogonRight")) {
+        throw "CRITICAL: Account $AccountName is explicitly denied $Right. Cannot proceed."
+    }
+    
+    [LsaWrapper]::GrantRight($sid, $Right)
+    
+    if (-not [LsaWrapper]::HasRight($sid, $Right)) {
+        throw "$Right verification failed for $AccountName"
+    }
+}
+# --- END LSA HELPER ---
 
 $AppPath = "C:\dev\LLMAccountabilityApp"
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
@@ -42,107 +215,14 @@ if (-not (Get-LocalUser -Name $RunnerUser -ErrorAction SilentlyContinue)) {
     Set-LocalUser -Name $RunnerUser -Password $RunnerSecure
 }
 
-Write-Host "Configuring local security policy for SeBatchLogonRight..."
-$tempInf = Join-Path $env:TEMP ("agy-" + [guid]::NewGuid() + ".inf")
-$tempDb  = Join-Path $env:TEMP ("agy-" + [guid]::NewGuid() + ".sdb")
-$tempLog = Join-Path $env:TEMP ("agy-" + [guid]::NewGuid() + ".log")
-
-Invoke-NativeCommand { secedit.exe /export /cfg $tempInf /areas USER_RIGHTS }
-
-$secPolContent = Get-Content $tempInf -Encoding Unicode
-
-$workerSid = (New-Object System.Security.Principal.NTAccount("$env:COMPUTERNAME\$WorkerUser")).Translate([System.Security.Principal.SecurityIdentifier]).Value
-$workerSidTarget = "*$workerSid"
-
-$denyLines = $secPolContent | Where-Object { $_ -match "^\s*SeDenyBatchLogonRight\s*=" }
-foreach ($denyLine in $denyLines) {
-    if ($denyLine -match [regex]::Escape($workerSidTarget)) {
-        Remove-Item $tempInf -Force -ErrorAction SilentlyContinue
-        Write-Error "CRITICAL: AGYWorker is explicitly denied log on as a batch job (SeDenyBatchLogonRight). Cannot proceed."
-        exit 1
-    }
-}
-
-$updated = $false
-$hasPrivSection = $false
-$newContent = @()
-
-foreach ($line in $secPolContent) {
-    if ($line -match "^\s*\[Privilege Rights\]") {
-        $hasPrivSection = $true
-    }
-    
-    if ($line -match "^\s*SeBatchLogonRight\s*=") {
-        if ($line -notmatch [regex]::Escape($workerSidTarget)) {
-            $line = "$line,$workerSidTarget"
-            $updated = $true
-        }
-    }
-    $newContent += $line
-}
-
-if (-not $hasPrivSection) {
-    $newContent += "[Privilege Rights]"
-    $newContent += "SeBatchLogonRight = $workerSidTarget"
-    $updated = $true
-} else {
-    $batchFound = $secPolContent | Where-Object { $_ -match "^\s*SeBatchLogonRight\s*=" }
-    if (-not $batchFound) {
-        $finalContent = @()
-        foreach ($line in $newContent) {
-            $finalContent += $line
-            if ($line -match "^\s*\[Privilege Rights\]") {
-                $finalContent += "SeBatchLogonRight = $workerSidTarget"
-                $updated = $true
-            }
-        }
-        $newContent = $finalContent
-    }
-}
-
-if ($updated) {
-    $newContent | Out-File -FilePath $tempInf -Encoding Unicode
-    
-    secedit.exe /configure /db $tempDb /cfg $tempInf /overwrite /areas USER_RIGHTS /log $tempLog | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "--- SECEDIT LOG ---"
-        if (Test-Path $tempLog) { Get-Content $tempLog | Write-Host }
-        Write-Host "--- GENERATED INF ---"
-        if (Test-Path $tempInf) { Get-Content $tempInf | Write-Host }
-        
-        Remove-Item $tempInf -Force -ErrorAction SilentlyContinue
-        Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
-        Remove-Item $tempLog -Force -ErrorAction SilentlyContinue
-        Write-Error "secedit configure failed with exit code $LASTEXITCODE"
-        exit 1
-    }
-}
-
-# 9. MOST IMPORTANT: verify the postcondition.
-$tempVerifyInf = Join-Path $env:TEMP ("agy-verify-" + [guid]::NewGuid() + ".inf")
-Invoke-NativeCommand { secedit.exe /export /cfg $tempVerifyInf /areas USER_RIGHTS }
-
-$verifyContent = Get-Content $tempVerifyInf -Encoding Unicode
-$verified = $false
-foreach ($line in $verifyContent) {
-    if ($line -match "^\s*SeBatchLogonRight\s*=") {
-        if ($line -match [regex]::Escape($workerSidTarget)) {
-            $verified = $true
-            break
-        }
-    }
-}
-
-Remove-Item $tempInf -Force -ErrorAction SilentlyContinue
-Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
-Remove-Item $tempLog -Force -ErrorAction SilentlyContinue
-Remove-Item $tempVerifyInf -Force -ErrorAction SilentlyContinue
-
-if (-not $verified) {
-    Write-Error "SeBatchLogonRight verification failed: SID $workerSidTarget not found in re-exported policy."
+Write-Host "Configuring local security policy for SeBatchLogonRight via LSA API..."
+try {
+    Grant-LsaRight -AccountName "$env:COMPUTERNAME\$WorkerUser" -Right "SeBatchLogonRight"
+    Write-Host "SeBatchLogonRight successfully verified for $WorkerUser."
+} catch {
+    Write-Error "Failed to grant SeBatchLogonRight: $_"
     exit 1
 }
-Write-Host "SeBatchLogonRight successfully verified for $WorkerUser."
 
 
 # --- Directory & Base ACLs ---
