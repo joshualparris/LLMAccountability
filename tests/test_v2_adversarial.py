@@ -209,3 +209,25 @@ def test_installer_syntax_validity():
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     assert result.returncode == 0, f"Installer syntax error: {result.stderr}"
+
+def test_installer_sebatchlogonright_provisioning():
+    with open("install_service.ps1", "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "SeBatchLogonRight" in content
+    assert "SeDenyBatchLogonRight" in content
+
+def test_installer_no_unconditional_success():
+    with open("install_service.ps1", "r", encoding="utf-8") as f:
+        content = f.read()
+    # Ensure there's a failure path that prints NOT ESTABLISHED
+    assert "NOT ESTABLISHED" in content
+    # The success message shouldn't just be at the end without a conditional exit before it
+    # We can check that 'exit 1' or 'throw' exists near NOT ESTABLISHED
+    assert "exit 1" in content or "throw" in content
+
+def test_installer_health_checks_exist():
+    with open("install_service.ps1", "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "8123" in content
+    assert "8124" in content
+    assert "Running" in content

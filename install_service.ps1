@@ -34,6 +34,58 @@ if (-not (Get-LocalUser -Name $RunnerUser -ErrorAction SilentlyContinue)) {
     Set-LocalUser -Name $RunnerUser -Password $RunnerSecure
 }
 
+Write-Host "Configuring local security policy for SeBatchLogonRight..."
+$tempSecPol = [IO.Path]::GetTempFileName()
+$tempDb = [IO.Path]::GetTempFileName()
+secedit.exe /export /cfg $tempSecPol /areas USER_RIGHTS | Out-Null
+$secPolContent = Get-Content $tempSecPol
+
+$workerSid = (New-Object System.Security.Principal.NTAccount($WorkerUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+$workerSidTarget = "*$workerSid"
+
+# 3. Explicitly detect "Deny log on as a batch job" conflicts
+$denyLines = $secPolContent | Where-Object { $_ -match "^\s*SeDenyBatchLogonRight\s*=" }
+foreach ($denyLine in $denyLines) {
+    if ($denyLine -match [regex]::Escape($workerSidTarget)) {
+        Remove-Item $tempSecPol -Force
+        Remove-Item $tempDb -Force
+        Write-Error "CRITICAL: AGYWorker is explicitly denied log on as a batch job (SeDenyBatchLogonRight). Cannot proceed."
+        exit 1
+    }
+}
+
+$updated = $false
+$batchLines = $secPolContent | Where-Object { $_ -match "^\s*SeBatchLogonRight\s*=" }
+
+$newContent = @()
+if ($batchLines.Count -gt 0) {
+    foreach ($line in $secPolContent) {
+        if ($line -match "^\s*SeBatchLogonRight\s*=") {
+            if ($line -notmatch [regex]::Escape($workerSidTarget)) {
+                $line = "$line,$workerSidTarget"
+                $updated = $true
+            }
+        }
+        $newContent += $line
+    }
+} else {
+    foreach ($line in $secPolContent) {
+        $newContent += $line
+        if ($line -match "^\s*\[Privilege Rights\]\s*$") {
+            $newContent += "SeBatchLogonRight = $workerSidTarget"
+            $updated = $true
+        }
+    }
+}
+
+if ($updated) {
+    $newContent | Set-Content $tempSecPol
+    secedit.exe /configure /db $tempDb /cfg $tempSecPol /areas USER_RIGHTS | Out-Null
+}
+Remove-Item $tempSecPol -Force
+Remove-Item $tempDb -Force
+
+
 # --- Directory & Base ACLs ---
 Write-Host "Securing protected directory before cryptographic initialization..."
 if (-not (Test-Path $ProtectedDir)) { New-Item -ItemType Directory -Path $ProtectedDir | Out-Null }
@@ -99,22 +151,21 @@ Set-StrictAcl "worker_secret.key" $WorkerRead
 Set-StrictAcl "runner_pwd.txt" $WorkerRead
 Set-StrictAcl "agy_worker.exe" $WorkerAccess
 
-# The Runner (AGYRunner) gets NO ACCESS to anything in this directory. 
-# It runs dynamically via ProcessStartInfo inside C:\dev\LLMAccountabilityApp.
-
 # --- Scheduled Tasks Registration ---
 Write-Host "Registering SYSTEM Notary Task..."
 if (Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $ServiceName -Confirm:$false }
 $ActionSvc = New-ScheduledTaskAction -Execute "$ProtectedDir\agy_service.exe" -WorkingDirectory $ProtectedDir
 $TriggerSvc = New-ScheduledTaskTrigger -AtStartup
 $PrincipalSvc = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName $ServiceName -Action $ActionSvc -Trigger $TriggerSvc -Principal $PrincipalSvc -Description "Protected Verification Service" | Out-Null
+$SettingsSvc = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -AllowDemandStart
+Register-ScheduledTask -TaskName $ServiceName -Action $ActionSvc -Trigger $TriggerSvc -Principal $PrincipalSvc -Settings $SettingsSvc -Description "Protected Verification Service" | Out-Null
 
 Write-Host "Registering Trusted Broker Task..."
 if (Get-ScheduledTask -TaskName $WorkerName -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $WorkerName -Confirm:$false }
 $ActionWkr = New-ScheduledTaskAction -Execute "$ProtectedDir\agy_worker.exe" -WorkingDirectory $ProtectedDir
 $TriggerWkr = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName $WorkerName -Action $ActionWkr -Trigger $TriggerWkr -User "$env:COMPUTERNAME\$WorkerUser" -Password $WorkerPasswordStr -RunLevel Limited -Description "Trusted Broker Service" | Out-Null
+$SettingsWkr = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -AllowDemandStart
+Register-ScheduledTask -TaskName $WorkerName -Action $ActionWkr -Trigger $TriggerWkr -Settings $SettingsWkr -User "$env:COMPUTERNAME\$WorkerUser" -Password $WorkerPasswordStr -RunLevel Limited -Description "Trusted Broker Service" | Out-Null
 
 Write-Host "Recording Installation Hashes..."
 Write-Host "agy_service.exe SHA256: $((Get-FileHash "$ProtectedDir\agy_service.exe" -Algorithm SHA256).Hash)"
@@ -123,5 +174,29 @@ Write-Host "agy_worker.exe SHA256: $((Get-FileHash "$ProtectedDir\agy_worker.exe
 Write-Host "Starting all services..."
 Start-ScheduledTask -TaskName $ServiceName
 Start-ScheduledTask -TaskName $WorkerName
+
+Write-Host "Verifying service health..."
+$MaxWait = 30
+$Passed = $false
+
+for ($i = 0; $i -lt $MaxWait; $i++) {
+    Start-Sleep -Seconds 1
+    
+    $SvcState = (Get-ScheduledTask -TaskName $ServiceName).State
+    $WkrState = (Get-ScheduledTask -TaskName $WorkerName).State
+    
+    $Port8123 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8123 -InformationLevel Quiet -WarningAction SilentlyContinue
+    $Port8124 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8124 -InformationLevel Quiet -WarningAction SilentlyContinue
+    
+    if ($SvcState -eq 'Running' -and $WkrState -eq 'Running' -and $Port8123 -and $Port8124) {
+        $Passed = $true
+        break
+    }
+}
+
+if (-not $Passed) {
+    Write-Error "NOT ESTABLISHED. Services failed to reach healthy Running/LISTENING state."
+    exit 1
+}
 
 Write-Host "Three-Tier Trust Boundary established successfully. The Notary and Broker are running."
