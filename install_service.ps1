@@ -187,6 +187,7 @@ function Grant-LsaRight {
 $RepoRoot = $PSScriptRoot
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
 $ScratchDir = "C:\ProgramData\AGYScratch"
+$RuntimeDir = "C:\ProgramData\AGYRuntime"
 
 $ServiceName = "AGYVerifierService"
 $ServiceExe = Join-Path $RepoRoot "dist\agy_service.exe"
@@ -313,6 +314,51 @@ $RunnerModify = New-Object System.Security.AccessControl.FileSystemAccessRule($R
 $ScratchAcl.AddAccessRule($WorkerModify)
 $ScratchAcl.AddAccessRule($RunnerModify)
 Set-Acl -Path $ScratchDir -AclObject $ScratchAcl
+
+# --- Runtime Directory Setup ---
+Write-Host "Creating protected verification runtime..."
+if (-not (Test-Path $RuntimeDir)) { New-Item -ItemType Directory -Path $RuntimeDir | Out-Null }
+$RuntimeAcl = Get-Acl $RuntimeDir
+$RuntimeAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in $RuntimeAcl.Access) { $RuntimeAcl.RemoveAccessRule($rule) | Out-Null }
+$RuntimeAcl.AddAccessRule($SysDirRule)
+$RuntimeAcl.AddAccessRule($AdminDirRule)
+$WorkerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+$RunnerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+$RuntimeAcl.AddAccessRule($WorkerReadExecDir)
+$RuntimeAcl.AddAccessRule($RunnerReadExecDir)
+Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
+
+$ProtectedPythonPath = Join-Path $RuntimeDir "python"
+if (-not (Test-Path $ProtectedPythonPath)) {
+    Write-Host "Provisioning Python venv in $ProtectedPythonPath..."
+    # We must run python to create the venv. We assume python is in the installer's PATH or we use the one from venv.
+    # The user asked: do not use the dev venvs, but we can use the system Python to bootstrap it.
+    $sysPython = "python.exe"
+    $proc = Start-Process -FilePath $sysPython -ArgumentList "-m", "venv", $ProtectedPythonPath -Wait -NoNewWindow -PassThru
+    if ($proc.ExitCode -ne 0) { throw "CRITICAL: Runtime creation failed." }
+}
+
+Write-Host "Installing dependencies into protected runtime..."
+$ProtectedPip = Join-Path $ProtectedPythonPath "Scripts\pip.exe"
+$ProtectedPythonExe = Join-Path $ProtectedPythonPath "Scripts\python.exe"
+if (-not (Test-Path $ProtectedPythonExe)) { throw "CRITICAL: Expected python.exe missing in runtime." }
+
+# Install dependencies
+$proc = Start-Process -FilePath $ProtectedPip -ArgumentList "install", "pytest==8.2.2", "pydantic==2.8.2", "typer==0.12.3", "pyyaml==6.0.1", "cryptography==42.0.8", "requests==2.32.3" -Wait -NoNewWindow -PassThru
+if ($proc.ExitCode -ne 0) { throw "CRITICAL: Dependency installation failed." }
+
+Write-Host "Testing pytest import in protected runtime..."
+$proc = Start-Process -FilePath $ProtectedPythonExe -ArgumentList "-c", "`"import pytest; print(pytest.__version__)`"" -Wait -NoNewWindow -PassThru
+if ($proc.ExitCode -ne 0) { throw "CRITICAL: pytest import failed." }
+
+# Re-apply ACLs to ensure everything created by pip inherits correctly
+Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
+
+Write-Host "Self-testing runtime AS $RunnerUser..."
+$RunnerCred = New-Object System.Management.Automation.PSCredential($RunnerUser, $RunnerSecure)
+$proc = Start-Process -FilePath $ProtectedPythonExe -ArgumentList "-c", "`"import pytest; print(pytest.__version__)`"" -Credential $RunnerCred -Wait -NoNewWindow -PassThru
+if ($proc.ExitCode -ne 0) { throw "CRITICAL: Runtime self-test AS AGYRunner failed." }
 
 # --- Cryptographic Migration ---
 Write-Host "Handling cryptographic boundary and archiving legacy ledgers..."

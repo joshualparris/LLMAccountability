@@ -131,6 +131,16 @@ def test_tests_recipe_fingerprint_toctou(monkeypatch, tmp_path):
         return {"exit_code": 0, "stdout": b"test passed", "stderr": b"", "spawn_error": None}
         
     monkeypatch.setattr(agy_worker, "run_as_runner", mock_run)
+    monkeypatch.setattr(agy_worker, "get_secret", lambda: b"mock_secret")
+    
+    monkeypatch.setattr(agy_worker, "SCRATCH_DIR", str(tmp_path / "scratch"), raising=False)
+    monkeypatch.setattr(agy_worker, "get_file_sha256", lambda path: "mock_hash")
+    
+    import subprocess
+    class MockCompletedProcess:
+        def __init__(self):
+            self.stdout = "8.2.2\n"
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: MockCompletedProcess())
     
     req = {"claim": "tests-pass", "repo_path": str(repo), "profile": "python-full"}
     resp = client.post("/execute", json=req)
@@ -155,6 +165,14 @@ def test_tests_recipe_fingerprint_stable(monkeypatch, tmp_path):
         return {"exit_code": 0, "stdout": b"test passed", "stderr": b"", "spawn_error": None}
         
     monkeypatch.setattr(agy_worker, "run_as_runner", mock_run)
+    monkeypatch.setattr(agy_worker, "get_secret", lambda: b"mock_secret")
+    monkeypatch.setattr(agy_worker, "SCRATCH_DIR", str(tmp_path / "scratch"), raising=False)
+    monkeypatch.setattr(agy_worker, "get_file_sha256", lambda path: "mock_hash")
+    import subprocess
+    class MockCompletedProcess:
+        def __init__(self):
+            self.stdout = "8.2.2\n"
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: MockCompletedProcess())
     
     req = {"claim": "tests-pass", "repo_path": str(repo), "profile": "python-full"}
     resp = client.post("/execute", json=req)

@@ -262,13 +262,14 @@ def execute(req: ExecuteRequest):
         elif req.claim == "tests-pass":
             repo_path = os.path.abspath(req.repo_path)
             
-            scratch_base = "C:\\ProgramData\\AGYScratch"
+            scratch_base = globals().get("SCRATCH_DIR", "C:\\ProgramData\\AGYScratch")
             scratch_dir = os.path.join(scratch_base, job_nonce)
             os.makedirs(scratch_dir, exist_ok=True)
             report_path = os.path.join(scratch_dir, "report.xml")
             
+            protected_python = "C:\\ProgramData\\AGYRuntime\\python\\Scripts\\python.exe"
             PROFILES = {
-                "python-full": ["python", "-m", "pytest", "-p", "no:cacheprovider", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--junitxml={report_path}"],
+                "python-full": [protected_python, "-m", "pytest", "-p", "no:cacheprovider", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--junitxml={report_path}"],
                 "npm-full": ["npm", "test"]
             }
             if req.profile not in PROFILES:
@@ -277,10 +278,25 @@ def execute(req: ExecuteRequest):
             evidence["command"] = " ".join(cmd)
             evidence["repo_path"] = repo_path
             
+            if req.profile == "python-full":
+                evidence["python_executable"] = protected_python
+                evidence["python_executable_sha256"] = get_file_sha256(protected_python)
+                
+                # Check pytest version
+                try:
+                    import subprocess
+                    pv = subprocess.run([protected_python, "-c", "import pytest; print(pytest.__version__)"], capture_output=True, text=True, check=True)
+                    evidence["pytest_version"] = pv.stdout.strip()
+                except Exception:
+                    evidence["pytest_version"] = "unknown"
+            
             fp_before, fp_count_before = _workspace_fingerprint(repo_path)
             
             # Set PYTHONDONTWRITEBYTECODE=1 in the worker environment so it inherits to the runner script
             os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+            if req.profile == "python-full":
+                os.environ["PYTHONPATH"] = os.path.join(repo_path, "src")
+                
             res = run_as_runner(cmd, repo_path)
             
             fp_after, fp_count_after = _workspace_fingerprint(repo_path)

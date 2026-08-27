@@ -252,6 +252,12 @@ def certify(req: ClaimRequest):
                 if passed + failures + skipped > collected:
                     raise ValueError("Inconsistent evidence: passed + failures + skipped > collected")
                     
+            if req.profile == "python-full":
+                if ev.get("python_executable") != "C:\\ProgramData\\AGYRuntime\\python\\Scripts\\python.exe":
+                    raise ValueError(f"Protected runtime not used: {ev.get('python_executable')}")
+                if ev.get("python_executable_sha256") is None:
+                    raise ValueError("Missing python_executable_sha256")
+                    
             status = "PASS"
 
         elif req.claim == "running":
