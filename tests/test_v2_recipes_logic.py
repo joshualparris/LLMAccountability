@@ -149,6 +149,39 @@ def test_tests_recipe_fingerprint_toctou(monkeypatch, tmp_path):
     assert evidence.get("diagnostic_reason") == "workspace changed during test execution"
     assert evidence.get("workspace_fingerprint") is None
 
+def test_pushed_recipe_no_fetch(monkeypatch):
+    import agy_worker
+    import subprocess
+    calls = []
+    
+    class MockCompletedProcess:
+        def __init__(self, stdout, stderr, returncode):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+            
+    def mock_run(args, *a, **k):
+        calls.append(args)
+        if "rev-parse" in args and "--abbrev-ref" in args:
+            return MockCompletedProcess("main\n", "", 0)
+        return MockCompletedProcess("success\n", "", 0)
+        
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(agy_worker, "get_secret", lambda: b"dummy")
+    
+    from fastapi.testclient import TestClient
+    client = TestClient(agy_worker.app)
+    client.post("/execute", json={
+        "id": "job-id",
+        "claim": "pushed",
+        "repo_path": ".",
+        "profile": "python-full",
+        "expected_bin_hash": "abc"
+    })
+    
+    for call in calls:
+        assert "fetch" not in call, "Worker pushed verification must NOT use fetch"
+
 def test_tests_recipe_fingerprint_stable(monkeypatch, tmp_path):
     import agy_worker
     from fastapi.testclient import TestClient

@@ -241,10 +241,8 @@ def execute(req: ExecuteRequest):
                     evidence[key]["spawn_error"] = sanitize_diagnostic(res["spawn_error"])
                 return res
 
-            res_fetch = run_git(["fetch", "origin"], "git_fetch")
-            if res_fetch["exit_code"] != 0 or res_fetch["spawn_error"]:
-                evidence["diagnostic_reason"] = sanitize_diagnostic("git fetch failed")
-                
+            run_git(["remote", "get-url", "origin"], "git_remote_url")
+            
             res_status = run_git(["status", "--porcelain"], "git_status")
             if res_status["exit_code"] != 0 or res_status["spawn_error"]:
                 if "diagnostic_reason" not in evidence:
@@ -255,7 +253,6 @@ def execute(req: ExecuteRequest):
             evidence["local_branch"] = sanitize_diagnostic(local_branch)
             
             run_git(["rev-parse", "HEAD"], "git_rev_parse_head")
-            run_git(["rev-parse", "@{u}"], "git_rev_parse_upstream")
             if local_branch != "unknown":
                 run_git(["ls-remote", "origin", f"refs/heads/{local_branch}"], "git_ls_remote")
             

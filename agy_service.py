@@ -210,7 +210,7 @@ def certify(req: ClaimRequest):
             ls_remote = ev.get("git_ls_remote", {}).get("stdout_snippet", "").strip()
             remote_sha = ls_remote.split()[0] if ls_remote else ""
             
-            remote_lookup_succeeded = git_remote_url.get("exit_code") == 0
+            remote_lookup_succeeded = git_remote_url.get("exit_code") == 0 and ev.get("git_ls_remote", {}).get("exit_code") == 0
             worktree_clean = git_status.get("exit_code") == 0 and git_status.get("stdout_snippet", "").strip() == ""
             local_branch = ev.get("local_branch", "unknown")
             remote_url = git_remote_url.get("stdout_snippet", "").strip()
@@ -243,20 +243,36 @@ def certify(req: ClaimRequest):
             errors = ev.get("errors")
             skipped = ev.get("skipped")
             
-            # If structured metrics are present, validate them
-            if collected is not None and failures is not None and passed is not None and skipped is not None:
-                if failures > 0 or (errors is not None and errors > 0):
-                    raise ValueError(f"Inconsistent evidence: exit_code is 0 but there are failures ({failures}) or errors ({errors})")
-                if collected < 0 or passed < 0 or failures < 0 or skipped < 0:
-                    raise ValueError("Inconsistent evidence: negative test metric counts")
-                if passed + failures + skipped > collected:
-                    raise ValueError("Inconsistent evidence: passed + failures + skipped > collected")
-                    
             if req.profile == "python-full":
+                if ev.get("diagnostic_reason"):
+                    raise ValueError(f"Diagnostic reason present: {ev.get('diagnostic_reason')}")
+                if not ev.get("workspace_fingerprint"):
+                    raise ValueError("Missing or empty workspace_fingerprint")
+                if ev.get("workspace_file_count") is None or ev.get("workspace_file_count") < 0:
+                    raise ValueError("Invalid workspace_file_count")
+                if collected is None or passed is None or failures is None or errors is None or skipped is None:
+                    raise ValueError("Missing required test metrics")
+                if failures != 0 or errors != 0:
+                    raise ValueError(f"Test failures or errors present: failures={failures}, errors={errors}")
+                if passed + failures + errors + skipped != collected:
+                    raise ValueError("Inconsistent test metrics sum")
+                
                 if ev.get("python_executable") != "C:\\ProgramData\\AGYRuntime\\python\\Scripts\\python.exe":
                     raise ValueError(f"Protected runtime not used: {ev.get('python_executable')}")
-                if ev.get("python_executable_sha256") is None:
+                if not ev.get("python_executable_sha256"):
                     raise ValueError("Missing python_executable_sha256")
+                pytest_version = ev.get("pytest_version")
+                if not pytest_version or pytest_version == "unknown":
+                    raise ValueError("Invalid or unknown pytest_version")
+            else:
+                # Fallback for other profiles
+                if collected is not None and failures is not None and passed is not None and skipped is not None:
+                    if failures > 0 or (errors is not None and errors > 0):
+                        raise ValueError(f"Inconsistent evidence: exit_code is 0 but there are failures ({failures}) or errors ({errors})")
+                    if collected < 0 or passed < 0 or failures < 0 or skipped < 0:
+                        raise ValueError("Inconsistent evidence: negative test metric counts")
+                    if passed + failures + skipped > collected:
+                        raise ValueError("Inconsistent evidence: passed + failures + skipped > collected")
                     
             status = "PASS"
 
