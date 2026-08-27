@@ -186,6 +186,7 @@ function Grant-LsaRight {
 
 $RepoRoot = $PSScriptRoot
 $ProtectedDir = "C:\ProgramData\AGYVerifier"
+$ScratchDir = "C:\ProgramData\AGYScratch"
 
 $ServiceName = "AGYVerifierService"
 $ServiceExe = Join-Path $RepoRoot "dist\agy_service.exe"
@@ -333,8 +334,6 @@ $SecretBytes = New-Object byte[] 32
 (New-Object System.Security.Cryptography.RNGCryptoServiceProvider).GetBytes($SecretBytes)
 [System.IO.File]::WriteAllBytes("$ProtectedDir\worker_secret.key", $SecretBytes)
 [System.IO.File]::WriteAllText("$ProtectedDir\runner_pwd.txt", $RunnerPasswordStr)
-
-$ScratchDir = "C:\ProgramData\AGYScratch"
 
 # --- Binary Deployment ---
 Write-Host "Deploying frozen binaries..."
