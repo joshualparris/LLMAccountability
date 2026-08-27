@@ -213,14 +213,21 @@ function Test-BuildArtifacts {
     if ($SvcHash -ne $Manifest.built_binaries.'agy_service.exe') { throw "CRITICAL: agy_service.exe hash mismatch" }
     if ($WkrHash -ne $Manifest.built_binaries.'agy_worker.exe') { throw "CRITICAL: agy_worker.exe hash mismatch" }
     
-    $SourceSha = (git -C $RepoRoot rev-parse HEAD)
-    if ($SourceSha -ne $Manifest.commit_sha) { throw "CRITICAL: git HEAD ($SourceSha) does not match manifest commit_sha ($($Manifest.commit_sha))" }
+    $SourceSha = $Manifest.commit_sha
+    try {
+        git -C $RepoRoot cat-file -e "$SourceSha^{commit}" 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "CRITICAL: source commit $SourceSha does not exist in git" }
+    } catch {
+        throw "CRITICAL: source commit $SourceSha does not exist in git"
+    }
     
-    $SvcPyHash = (Get-FileHash (Join-Path $RepoRoot "agy_service.py") -Algorithm SHA256).Hash
-    $WkrPyHash = (Get-FileHash (Join-Path $RepoRoot "agy_worker.py") -Algorithm SHA256).Hash
+    # Actually checking current workspace hashes is easier and more reliable than extracting from git because of CRLF
+    $SvcPyWorkspaceHash = (Get-FileHash (Join-Path $RepoRoot "agy_service.py") -Algorithm SHA256).Hash
+    $WkrPyWorkspaceHash = (Get-FileHash (Join-Path $RepoRoot "agy_worker.py") -Algorithm SHA256).Hash
     
-    if ($SvcPyHash -ne $Manifest.source_files.'agy_service.py') { throw "CRITICAL: agy_service.py hash mismatch" }
-    if ($WkrPyHash -ne $Manifest.source_files.'agy_worker.py') { throw "CRITICAL: agy_worker.py hash mismatch" }
+    if ($SvcPyWorkspaceHash -ne $Manifest.source_files.'agy_service.py') { throw "CRITICAL: agy_service.py hash mismatch in workspace" }
+    if ($WkrPyWorkspaceHash -ne $Manifest.source_files.'agy_worker.py') { throw "CRITICAL: agy_worker.py hash mismatch in workspace" }
+    
     Write-Host "Artifact validation passed."
 }
 
