@@ -317,48 +317,97 @@ Set-Acl -Path $ScratchDir -AclObject $ScratchAcl
 
 # --- Runtime Directory Setup ---
 Write-Host "Creating protected verification runtime..."
-if (-not (Test-Path $RuntimeDir)) { New-Item -ItemType Directory -Path $RuntimeDir | Out-Null }
-$RuntimeAcl = Get-Acl $RuntimeDir
-$RuntimeAcl.SetAccessRuleProtection($true, $false)
-foreach ($rule in $RuntimeAcl.Access) { $RuntimeAcl.RemoveAccessRule($rule) | Out-Null }
-$RuntimeAcl.AddAccessRule($SysDirRule)
-$RuntimeAcl.AddAccessRule($AdminDirRule)
-$WorkerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
-$RunnerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
-$RuntimeAcl.AddAccessRule($WorkerReadExecDir)
-$RuntimeAcl.AddAccessRule($RunnerReadExecDir)
-Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
 
+$RuntimeDir = "C:\ProgramData\AGYRuntime"
 $ProtectedPythonPath = Join-Path $RuntimeDir "python"
-if (-not (Test-Path $ProtectedPythonPath)) {
+$ProtectedPythonExe = Join-Path $ProtectedPythonPath "Scripts\python.exe"
+
+$SelfTestScript = @"
+import sys
+import pytest
+import pydantic
+import cryptography
+import requests
+import yaml
+import typer
+
+print(sys.version)
+print(pytest.__version__)
+print(pydantic.__version__)
+
+assert sys.version_info[:2] == (3, 14), f"Python version is {sys.version_info}"
+assert pydantic.__version__ == "2.13.4", f"Pydantic version is {pydantic.__version__}"
+assert pytest.__version__ == "8.2.2", f"Pytest version is {pytest.__version__}"
+"@
+
+$RuntimeIsHealthy = $false
+if (Test-Path $ProtectedPythonExe) {
+    Write-Host "Existing AGYRuntime found. Running self-test to check health..."
+    $procInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $procInfo.FileName = $ProtectedPythonExe
+    $procInfo.Arguments = "-c `"$SelfTestScript`""
+    $procInfo.UseShellExecute = $false
+    $procInfo.CreateNoWindow = $true
+    
+    $proc = [System.Diagnostics.Process]::Start($procInfo)
+    $proc.WaitForExit()
+    if ($proc.ExitCode -eq 0) {
+        $RuntimeIsHealthy = $true
+    } else {
+        Write-Host "AGYRuntime exists but failed self-test. Recreating..."
+    }
+}
+
+if (-not $RuntimeIsHealthy) {
+    if (Test-Path $RuntimeDir) {
+        Remove-Item -Path $RuntimeDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $RuntimeDir | Out-Null
+    
+    $RuntimeAcl = Get-Acl $RuntimeDir
+    $RuntimeAcl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in $RuntimeAcl.Access) { $RuntimeAcl.RemoveAccessRule($rule) | Out-Null }
+    $RuntimeAcl.AddAccessRule($SysDirRule)
+    $RuntimeAcl.AddAccessRule($AdminDirRule)
+    $WorkerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $RunnerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $RuntimeAcl.AddAccessRule($WorkerReadExecDir)
+    $RuntimeAcl.AddAccessRule($RunnerReadExecDir)
+    Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
+
     Write-Host "Provisioning Python venv in $ProtectedPythonPath..."
-    # We must run python to create the venv. We assume python is in the installer's PATH or we use the one from venv.
-    # The user asked: do not use the dev venvs, but we can use the system Python to bootstrap it.
     $sysPython = "python.exe"
     $proc = Start-Process -FilePath $sysPython -ArgumentList "-m", "venv", $ProtectedPythonPath -Wait -NoNewWindow -PassThru
     if ($proc.ExitCode -ne 0) { throw "CRITICAL: Runtime creation failed." }
+
+    Write-Host "Installing dependencies into protected runtime..."
+    $ProtectedPip = Join-Path $ProtectedPythonPath "Scripts\pip.exe"
+    
+    $proc = Start-Process -FilePath $ProtectedPip -ArgumentList "install", "pytest==8.2.2", "pydantic==2.13.4", "typer==0.12.3", "pyyaml==6.0.1", "cryptography==42.0.8", "requests==2.32.3" -Wait -NoNewWindow -PassThru
+    if ($proc.ExitCode -ne 0) { throw "CRITICAL: Dependency installation failed." }
+
+    # Re-apply ACLs to ensure everything created by pip inherits correctly
+    Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
 }
-
-Write-Host "Installing dependencies into protected runtime..."
-$ProtectedPip = Join-Path $ProtectedPythonPath "Scripts\pip.exe"
-$ProtectedPythonExe = Join-Path $ProtectedPythonPath "Scripts\python.exe"
-if (-not (Test-Path $ProtectedPythonExe)) { throw "CRITICAL: Expected python.exe missing in runtime." }
-
-# Install dependencies
-$proc = Start-Process -FilePath $ProtectedPip -ArgumentList "install", "pytest==8.2.2", "pydantic==2.8.2", "typer==0.12.3", "pyyaml==6.0.1", "cryptography==42.0.8", "requests==2.32.3" -Wait -NoNewWindow -PassThru
-if ($proc.ExitCode -ne 0) { throw "CRITICAL: Dependency installation failed." }
-
-Write-Host "Testing pytest import in protected runtime..."
-$proc = Start-Process -FilePath $ProtectedPythonExe -ArgumentList "-c", "`"import pytest; print(pytest.__version__)`"" -Wait -NoNewWindow -PassThru
-if ($proc.ExitCode -ne 0) { throw "CRITICAL: pytest import failed." }
-
-# Re-apply ACLs to ensure everything created by pip inherits correctly
-Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
 
 Write-Host "Self-testing runtime AS $RunnerUser..."
 $RunnerCred = New-Object System.Management.Automation.PSCredential($RunnerUser, $RunnerSecure)
-$proc = Start-Process -FilePath $ProtectedPythonExe -ArgumentList "-c", "`"import pytest; print(pytest.__version__)`"" -Credential $RunnerCred -Wait -NoNewWindow -PassThru
+
+$ScriptPath = Join-Path $ScratchDir "selftest.py"
+[System.IO.File]::WriteAllText($ScriptPath, $SelfTestScript)
+
+$procInfo = New-Object System.Diagnostics.ProcessStartInfo
+$procInfo.FileName = $ProtectedPythonExe
+$procInfo.Arguments = $ScriptPath
+$procInfo.UseShellExecute = $false
+$procInfo.CreateNoWindow = $true
+$procInfo.UserName = $RunnerUser
+$procInfo.Password = $RunnerCred.Password
+
+$proc = [System.Diagnostics.Process]::Start($procInfo)
+$proc.WaitForExit()
 if ($proc.ExitCode -ne 0) { throw "CRITICAL: Runtime self-test AS AGYRunner failed." }
+Remove-Item -Path $ScriptPath -Force
 
 # --- Cryptographic Migration ---
 Write-Host "Handling cryptographic boundary and archiving legacy ledgers..."
