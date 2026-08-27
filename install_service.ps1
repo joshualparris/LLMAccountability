@@ -196,31 +196,49 @@ $WorkerUser = "AGYWorker"
 
 $RunnerUser = "AGYRunner"
 
-if (-not (Test-Path $ServiceExe)) { Write-Error "Missing agy_service.exe"; exit 1 }
-if (-not (Test-Path $WorkerExe)) { Write-Error "Missing agy_worker.exe"; exit 1 }
-
-$ScratchDir = "C:\ProgramData\AGYScratch"
-
-if ($Preflight) {
-    Write-Host "Running Preflight checks..."
-    
+function Test-BuildArtifacts {
+    Write-Host "Validating Build Artifacts..."
     $ManifestPath = Join-Path $RepoRoot "dist\build_manifest.json"
-    if (-not (Test-Path $ManifestPath)) { Write-Error "Missing build_manifest.json"; exit 1 }
+    if (-not (Test-Path $ManifestPath)) { throw "CRITICAL: Missing build_manifest.json" }
     
     $Manifest = Get-Content $ManifestPath | ConvertFrom-Json
-    if (-not $Manifest.commit_sha) { Write-Error "Missing commit_sha in manifest"; exit 1 }
+    if (-not $Manifest.commit_sha) { throw "CRITICAL: Missing commit_sha in manifest" }
+    
+    if (-not (Test-Path $ServiceExe)) { throw "CRITICAL: Missing agy_service.exe" }
+    if (-not (Test-Path $WorkerExe)) { throw "CRITICAL: Missing agy_worker.exe" }
     
     $SvcHash = (Get-FileHash $ServiceExe -Algorithm SHA256).Hash
     $WkrHash = (Get-FileHash $WorkerExe -Algorithm SHA256).Hash
     
-    if ($SvcHash -ne $Manifest.built_binaries.'agy_service.exe') { Write-Error "agy_service.exe hash mismatch"; exit 1 }
-    if ($WkrHash -ne $Manifest.built_binaries.'agy_worker.exe') { Write-Error "agy_worker.exe hash mismatch"; exit 1 }
+    if ($SvcHash -ne $Manifest.built_binaries.'agy_service.exe') { throw "CRITICAL: agy_service.exe hash mismatch" }
+    if ($WkrHash -ne $Manifest.built_binaries.'agy_worker.exe') { throw "CRITICAL: agy_worker.exe hash mismatch" }
+    
+    $SourceSha = (git -C $RepoRoot rev-parse HEAD)
+    if ($SourceSha -ne $Manifest.commit_sha) { throw "CRITICAL: git HEAD ($SourceSha) does not match manifest commit_sha ($($Manifest.commit_sha))" }
+    
+    $SvcPyHash = (Get-FileHash (Join-Path $RepoRoot "agy_service.py") -Algorithm SHA256).Hash
+    $WkrPyHash = (Get-FileHash (Join-Path $RepoRoot "agy_worker.py") -Algorithm SHA256).Hash
+    
+    if ($SvcPyHash -ne $Manifest.source_files.'agy_service.py') { throw "CRITICAL: agy_service.py hash mismatch" }
+    if ($WkrPyHash -ne $Manifest.source_files.'agy_worker.py') { throw "CRITICAL: agy_worker.py hash mismatch" }
+    Write-Host "Artifact validation passed."
+}
+
+if ($Preflight) {
+    Write-Host "Running Preflight checks..."
+    
+    Test-BuildArtifacts
     
     $Port8123 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8123 -InformationLevel Quiet -WarningAction SilentlyContinue
-    if ($Port8123) { Write-Error "Port 8123 is already occupied." }
+    $Port8124 = Test-NetConnection -ComputerName 127.0.0.1 -Port 8124 -InformationLevel Quiet -WarningAction SilentlyContinue
+    if ($Port8123) { throw "Preflight Failed: Port 8123 is already occupied." }
+    if ($Port8124) { throw "Preflight Failed: Port 8124 is already occupied." }
     
     $GitStatus = (git -C $RepoRoot status --porcelain)
-    Write-Host "Git status: $GitStatus"
+    if ($GitStatus) {
+        Write-Host "Git status: $GitStatus"
+        throw "Preflight Failed: Git workspace is dirty."
+    }
     
     Write-Host "Preflight complete. All checks passed."
     exit 0
@@ -309,8 +327,11 @@ $SecretBytes = New-Object byte[] 32
 [System.IO.File]::WriteAllBytes("$ProtectedDir\worker_secret.key", $SecretBytes)
 [System.IO.File]::WriteAllText("$ProtectedDir\runner_pwd.txt", $RunnerPasswordStr)
 
+$ScratchDir = "C:\ProgramData\AGYScratch"
+
 # --- Binary Deployment ---
 Write-Host "Deploying frozen binaries..."
+Test-BuildArtifacts
 Copy-Item -Path $ServiceExe -Destination "$ProtectedDir\agy_service.exe" -Force
 Copy-Item -Path $WorkerExe -Destination "$ProtectedDir\agy_worker.exe" -Force
 

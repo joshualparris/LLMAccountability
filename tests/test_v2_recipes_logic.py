@@ -112,3 +112,53 @@ def test_git_recipe_success_differing_shas(monkeypatch):
     recipe = GitPushRecipe()
     res = recipe.verify({"claim": "pushed"}, {})
     assert res.verdict == Verdict.FAIL
+def test_tests_recipe_fingerprint_toctou(monkeypatch, tmp_path):
+    import agy_worker
+    from fastapi.testclient import TestClient
+    import os
+
+    client = TestClient(agy_worker.app)
+    
+    # create dummy repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "test.py").write_text("print('test')")
+    
+    # Mock run_as_runner to simulate the test running AND the source changing during execution
+    def mock_run(cmd, cwd):
+        # simulate modifying the workspace
+        (repo / "test.py").write_text("print('hacked')")
+        return {"exit_code": 0, "stdout": b"test passed", "stderr": b"", "spawn_error": None}
+        
+    monkeypatch.setattr(agy_worker, "run_as_runner", mock_run)
+    
+    req = {"claim": "tests-pass", "repo_path": str(repo), "profile": "python-full"}
+    resp = client.post("/execute", json=req)
+    assert resp.status_code == 200
+    evidence = resp.json()["evidence"]
+    assert evidence.get("diagnostic_reason") == "workspace changed during test execution"
+    assert evidence.get("workspace_fingerprint") is None
+
+def test_tests_recipe_fingerprint_stable(monkeypatch, tmp_path):
+    import agy_worker
+    from fastapi.testclient import TestClient
+    import os
+
+    client = TestClient(agy_worker.app)
+    
+    # create dummy repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "test.py").write_text("print('test')")
+    
+    def mock_run(cmd, cwd):
+        return {"exit_code": 0, "stdout": b"test passed", "stderr": b"", "spawn_error": None}
+        
+    monkeypatch.setattr(agy_worker, "run_as_runner", mock_run)
+    
+    req = {"claim": "tests-pass", "repo_path": str(repo), "profile": "python-full"}
+    resp = client.post("/execute", json=req)
+    assert resp.status_code == 200
+    evidence = resp.json()["evidence"]
+    assert evidence.get("workspace_fingerprint") is not None
+    assert evidence.get("diagnostic_reason") is None

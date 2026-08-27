@@ -277,13 +277,21 @@ def execute(req: ExecuteRequest):
             evidence["command"] = " ".join(cmd)
             evidence["repo_path"] = repo_path
             
-            fp, fp_count = _workspace_fingerprint(repo_path)
-            evidence["workspace_fingerprint"] = fp
-            evidence["workspace_file_count"] = fp_count
+            fp_before, fp_count_before = _workspace_fingerprint(repo_path)
             
             # Set PYTHONDONTWRITEBYTECODE=1 in the worker environment so it inherits to the runner script
             os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
             res = run_as_runner(cmd, repo_path)
+            
+            fp_after, fp_count_after = _workspace_fingerprint(repo_path)
+            
+            if fp_before != fp_after or fp_count_before != fp_count_after:
+                evidence["diagnostic_reason"] = "workspace changed during test execution"
+                evidence["workspace_fingerprint"] = None
+                evidence["workspace_file_count"] = None
+            else:
+                evidence["workspace_fingerprint"] = fp_after
+                evidence["workspace_file_count"] = fp_count_after
             
             evidence["exit_code"] = res["exit_code"]
             evidence["stdout_snippet"] = sanitize_diagnostic(res["stdout"])
