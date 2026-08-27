@@ -262,11 +262,11 @@ def execute(req: ExecuteRequest):
             scratch_base = globals().get("SCRATCH_DIR", "C:\\ProgramData\\AGYScratch")
             scratch_dir = os.path.join(scratch_base, job_nonce)
             os.makedirs(scratch_dir, exist_ok=True)
-            report_path = os.path.join(scratch_dir, "report.xml")
+            report_path = os.path.join(scratch_dir, "report.jsonl")
             
             protected_python = "C:\\ProgramData\\AGYRuntime\\python\\Scripts\\python.exe"
             PROFILES = {
-                "python-full": [protected_python, "-m", "pytest", "-p", "no:cacheprovider", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--junitxml={report_path}"],
+                "python-full": [protected_python, "-m", "pytest", "-p", "no:cacheprovider", "--ignore=tests/test_elevated_sebatchlogonright.py", f"--report-log={report_path}"],
                 "npm-full": ["npm", "test"]
             }
             if req.profile not in PROFILES:
@@ -313,24 +313,71 @@ def execute(req: ExecuteRequest):
                 evidence["spawn_error"] = sanitize_diagnostic(res["spawn_error"])
                 evidence["diagnostic_reason"] = sanitize_diagnostic("failed to spawn tests")
                 
-            if req.profile == "python-full" and os.path.exists(report_path):
-                import xml.etree.ElementTree as ET
-                try:
-                    tree = ET.parse(report_path)
-                    root = tree.getroot()
-                    if root.tag == "testsuites":
-                        suite = root.find("testsuite")
-                    else:
-                        suite = root
-                    
-                    if suite is not None:
-                        evidence["tests"] = int(suite.get("tests", 0))
-                        evidence["failures"] = int(suite.get("failures", 0))
-                        evidence["errors"] = int(suite.get("errors", 0))
-                        evidence["skipped"] = int(suite.get("skipped", 0))
-                        evidence["passed"] = evidence["tests"] - evidence["failures"] - evidence["errors"] - evidence["skipped"]
-                except Exception as e:
-                    evidence["diagnostic_reason"] = f"failed to parse junitxml: {e}"
+            if req.profile == "python-full":
+                if not os.path.exists(report_path) or os.path.getsize(report_path) == 0:
+                    evidence["diagnostic_reason"] = "pytest report log missing or empty"
+                else:
+                    import json
+                    try:
+                        tests_dict = {}
+                        session_finish = None
+                        with open(report_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                record = json.loads(line)
+                                rtype = record.get("$report_type")
+                                if rtype == "SessionFinish":
+                                    session_finish = record
+                                elif rtype == "TestReport":
+                                    nodeid = record.get("nodeid")
+                                    if not nodeid:
+                                        continue
+                                    when = record.get("when")
+                                    outcome = record.get("outcome")
+                                    if nodeid not in tests_dict:
+                                        tests_dict[nodeid] = {"setup": None, "call": None, "teardown": None}
+                                    if when in tests_dict[nodeid]:
+                                        tests_dict[nodeid][when] = outcome
+                        
+                        if session_finish is None:
+                            evidence["diagnostic_reason"] = "pytest report log missing SessionFinish"
+                        elif "exitstatus" not in session_finish:
+                            evidence["diagnostic_reason"] = "SessionFinish missing exitstatus"
+                        elif session_finish["exitstatus"] != evidence.get("exit_code"):
+                            evidence["diagnostic_reason"] = "pytest process exit code does not match report-log SessionFinish"
+                        else:
+                            passed = 0
+                            failures = 0
+                            errors = 0
+                            skipped = 0
+                            classified_tests = 0
+                            for nodeid, phases in tests_dict.items():
+                                classified = False
+                                if phases["setup"] == "failed" or phases["teardown"] == "failed":
+                                    errors += 1
+                                    classified = True
+                                elif phases["call"] == "skipped" or (phases["setup"] == "skipped" and phases["call"] is None):
+                                    skipped += 1
+                                    classified = True
+                                elif phases["call"] == "failed":
+                                    failures += 1
+                                    classified = True
+                                elif phases["call"] == "passed" and phases["setup"] != "failed" and phases["teardown"] != "failed":
+                                    passed += 1
+                                    classified = True
+                                
+                                if classified:
+                                    classified_tests += 1
+
+                            evidence["tests"] = classified_tests
+                            evidence["passed"] = passed
+                            evidence["failures"] = failures
+                            evidence["errors"] = errors
+                            evidence["skipped"] = skipped
+                    except Exception as e:
+                        evidence["diagnostic_reason"] = f"failed to parse reportlog: {e}"
                 
             import shutil
             shutil.rmtree(scratch_dir, ignore_errors=True)
