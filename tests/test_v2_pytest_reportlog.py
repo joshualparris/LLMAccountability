@@ -105,3 +105,48 @@ def test_92_passing_events(tmp_path):
     assert ev["failures"] == 0
     assert ev["skipped"] == 0
     assert ev["errors"] == 0
+def test_session_finish_only(tmp_path):
+    # Case A: SessionFinish(exitstatus=0) only => Worker diagnostic failure
+    ev = simulate_worker(tmp_path, [
+        {"$report_type": "SessionFinish", "exitstatus": 0}
+    ], exit_code=0)
+    assert ev.get("diagnostic_reason") == "pytest report log contains no test reports"
+
+def test_setup_passed_no_call_session_finish(tmp_path):
+    # Case B: setup passed + no call + SessionFinish
+    ev = simulate_worker(tmp_path, [
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "setup", "outcome": "passed"},
+        {"$report_type": "SessionFinish", "exitstatus": 0}
+    ], exit_code=0)
+    assert ev.get("diagnostic_reason") == "pytest report log contains incomplete or unclassifiable test reports"
+
+def test_setup_passed_call_passed_no_teardown(tmp_path):
+    # Case C: setup passed + call passed + no teardown
+    ev = simulate_worker(tmp_path, [
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "setup", "outcome": "passed"},
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "call", "outcome": "passed"},
+        {"$report_type": "SessionFinish", "exitstatus": 0}
+    ], exit_code=0)
+    assert ev.get("diagnostic_reason") == "pytest report log contains incomplete or unclassifiable test reports"
+
+def test_unknown_outcome(tmp_path):
+    # Case D: unknown outcome
+    ev = simulate_worker(tmp_path, [
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "setup", "outcome": "passed"},
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "call", "outcome": "unknown_outcome_value"},
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "teardown", "outcome": "passed"},
+        {"$report_type": "SessionFinish", "exitstatus": 0}
+    ], exit_code=0)
+    assert ev.get("diagnostic_reason") == "pytest report log contains incomplete or unclassifiable test reports"
+
+def test_valid_setup_skip_no_call(tmp_path):
+    # Case E: valid setup skip / no call
+    ev = simulate_worker(tmp_path, [
+        {"$report_type": "TestReport", "nodeid": "t1", "when": "setup", "outcome": "skipped"},
+        {"$report_type": "SessionFinish", "exitstatus": 0}
+    ], exit_code=0)
+    assert not ev.get("diagnostic_reason")
+    assert ev["tests"] == 1
+    assert ev["skipped"] == 1
+    assert ev["passed"] == 0
+

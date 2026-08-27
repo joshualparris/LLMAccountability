@@ -213,3 +213,38 @@ def test_tests_recipe_fingerprint_stable(monkeypatch, tmp_path):
     evidence = resp.json()["evidence"]
     assert evidence.get("workspace_fingerprint") is not None
     assert evidence.get("diagnostic_reason") is None
+
+def test_tests_recipe_zero_metrics(monkeypatch):
+    from v2.recipes.tests import TestsPassRecipe
+    import json
+    
+    class MockRes:
+        def __init__(self):
+            self.status_code = 200
+        def json(self):
+            return {
+                "status": "PASS",
+                "evidence": {
+                    "exit_code": 0,
+                    "tests": 0,
+                    "passed": 0,
+                    "failures": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                    "workspace_fingerprint": "abcd",
+                    "workspace_file_count": 10,
+                    "python_executable": "C:\\ProgramData\\AGYRuntime\\python\\Scripts\\python.exe",
+                    "python_executable_sha256": "aaaa",
+                    "pytest_version": "8.2.2"
+                },
+                "signature": "mock_sig"
+            }
+            
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: MockRes())
+    monkeypatch.setattr("agy_service.verify_worker_signature", lambda ev, sig: True)
+    
+    claim = {"type": "tests-pass", "id": "t1"}
+    
+    res = TestsPassRecipe().verify(claim, {})
+    assert res.verdict.name == "FAIL"
+

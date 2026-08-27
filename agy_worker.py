@@ -347,6 +347,8 @@ def execute(req: ExecuteRequest):
                             evidence["diagnostic_reason"] = "SessionFinish missing exitstatus"
                         elif session_finish["exitstatus"] != evidence.get("exit_code"):
                             evidence["diagnostic_reason"] = "pytest process exit code does not match report-log SessionFinish"
+                        elif not tests_dict:
+                            evidence["diagnostic_reason"] = "pytest report log contains no test reports"
                         else:
                             passed = 0
                             failures = 0
@@ -354,28 +356,30 @@ def execute(req: ExecuteRequest):
                             skipped = 0
                             classified_tests = 0
                             for nodeid, phases in tests_dict.items():
-                                classified = False
                                 if phases["setup"] == "failed" or phases["teardown"] == "failed":
                                     errors += 1
-                                    classified = True
-                                elif phases["call"] == "skipped" or (phases["setup"] == "skipped" and phases["call"] is None):
-                                    skipped += 1
-                                    classified = True
-                                elif phases["call"] == "failed":
-                                    failures += 1
-                                    classified = True
-                                elif phases["call"] == "passed" and phases["setup"] != "failed" and phases["teardown"] != "failed":
-                                    passed += 1
-                                    classified = True
-                                
-                                if classified:
                                     classified_tests += 1
-
-                            evidence["tests"] = classified_tests
-                            evidence["passed"] = passed
-                            evidence["failures"] = failures
-                            evidence["errors"] = errors
-                            evidence["skipped"] = skipped
+                                elif phases["setup"] == "skipped" and phases["call"] is None:
+                                    skipped += 1
+                                    classified_tests += 1
+                                elif phases["call"] == "skipped":
+                                    skipped += 1
+                                    classified_tests += 1
+                                elif phases["setup"] == "passed" and phases["call"] == "failed" and phases["teardown"] is not None and phases["teardown"] != "failed":
+                                    failures += 1
+                                    classified_tests += 1
+                                elif phases["setup"] == "passed" and phases["call"] == "passed" and phases["teardown"] is not None and phases["teardown"] != "failed":
+                                    passed += 1
+                                    classified_tests += 1
+                                
+                            if classified_tests != len(tests_dict):
+                                evidence["diagnostic_reason"] = "pytest report log contains incomplete or unclassifiable test reports"
+                            else:
+                                evidence["tests"] = classified_tests
+                                evidence["passed"] = passed
+                                evidence["failures"] = failures
+                                evidence["errors"] = errors
+                                evidence["skipped"] = skipped
                     except Exception as e:
                         evidence["diagnostic_reason"] = f"failed to parse reportlog: {e}"
                 

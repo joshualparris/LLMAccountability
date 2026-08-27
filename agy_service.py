@@ -252,6 +252,12 @@ def certify(req: ClaimRequest):
                     raise ValueError("Invalid workspace_file_count")
                 if collected is None or passed is None or failures is None or errors is None or skipped is None:
                     raise ValueError("Missing required test metrics")
+                if not isinstance(collected, int) or not isinstance(passed, int) or not isinstance(failures, int) or not isinstance(errors, int) or not isinstance(skipped, int):
+                    raise ValueError("Test metrics must be integers")
+                if collected <= 0:
+                    raise ValueError("collected tests must be > 0")
+                if passed < 0 or failures < 0 or errors < 0 or skipped < 0:
+                    raise ValueError("Test metrics cannot be negative")
                 if failures != 0 or errors != 0:
                     raise ValueError(f"Test failures or errors present: failures={failures}, errors={errors}")
                 if passed + failures + errors + skipped != collected:
