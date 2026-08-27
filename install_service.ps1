@@ -364,17 +364,6 @@ if (-not $RuntimeIsHealthy) {
     }
     New-Item -ItemType Directory -Path $RuntimeDir | Out-Null
     
-    $RuntimeAcl = Get-Acl $RuntimeDir
-    $RuntimeAcl.SetAccessRuleProtection($true, $false)
-    foreach ($rule in $RuntimeAcl.Access) { $RuntimeAcl.RemoveAccessRule($rule) | Out-Null }
-    $RuntimeAcl.AddAccessRule($SysDirRule)
-    $RuntimeAcl.AddAccessRule($AdminDirRule)
-    $WorkerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
-    $RunnerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
-    $RuntimeAcl.AddAccessRule($WorkerReadExecDir)
-    $RuntimeAcl.AddAccessRule($RunnerReadExecDir)
-    Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
-
     Write-Host "Provisioning Python venv in $ProtectedPythonPath..."
     $sysPython = "python.exe"
     $proc = Start-Process -FilePath $sysPython -ArgumentList "-m", "venv", $ProtectedPythonPath -Wait -NoNewWindow -PassThru
@@ -385,10 +374,21 @@ if (-not $RuntimeIsHealthy) {
     
     $proc = Start-Process -FilePath $ProtectedPip -ArgumentList "install", "pytest==8.2.2", "pydantic==2.13.4", "typer==0.12.3", "pyyaml==6.0.1", "cryptography==42.0.8", "requests==2.32.3" -Wait -NoNewWindow -PassThru
     if ($proc.ExitCode -ne 0) { throw "CRITICAL: Dependency installation failed." }
-
-    # Re-apply ACLs to ensure everything created by pip inherits correctly
-    Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
 }
+
+# 2. ALWAYS ENFORCE AGYRUNTIME ACLS
+Write-Host "Enforcing canonical ACL on AGYRuntime..."
+if (-not (Test-Path $RuntimeDir)) { New-Item -ItemType Directory -Path $RuntimeDir | Out-Null }
+$RuntimeAcl = Get-Acl $RuntimeDir
+$RuntimeAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in $RuntimeAcl.Access) { $RuntimeAcl.RemoveAccessRule($rule) | Out-Null }
+$RuntimeAcl.AddAccessRule($SysDirRule)
+$RuntimeAcl.AddAccessRule($AdminDirRule)
+$WorkerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($WorkerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+$RunnerReadExecDir = New-Object System.Security.AccessControl.FileSystemAccessRule($RunnerUser, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+$RuntimeAcl.AddAccessRule($WorkerReadExecDir)
+$RuntimeAcl.AddAccessRule($RunnerReadExecDir)
+Set-Acl -Path $RuntimeDir -AclObject $RuntimeAcl
 
 Write-Host "Self-testing runtime AS $RunnerUser..."
 $RunnerCred = New-Object System.Management.Automation.PSCredential($RunnerUser, $RunnerSecure)
@@ -403,11 +403,51 @@ $procInfo.UseShellExecute = $false
 $procInfo.CreateNoWindow = $true
 $procInfo.UserName = $RunnerUser
 $procInfo.Password = $RunnerCred.Password
+$procInfo.WorkingDirectory = $ScratchDir
 
 $proc = [System.Diagnostics.Process]::Start($procInfo)
 $proc.WaitForExit()
 if ($proc.ExitCode -ne 0) { throw "CRITICAL: Runtime self-test AS AGYRunner failed." }
 Remove-Item -Path $ScriptPath -Force
+
+Write-Host "Running negative write probe AS $RunnerUser..."
+$WriteProbeScript = @"
+import sys
+
+probe_path = r"C:\ProgramData\AGYRuntime\agy_runner_write_probe.tmp"
+try:
+    with open(probe_path, "w") as f:
+        f.write("tamper")
+    sys.exit(0)
+except PermissionError:
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+"@
+
+$ProbeScriptPath = Join-Path $ScratchDir "write_probe.py"
+[System.IO.File]::WriteAllText($ProbeScriptPath, $WriteProbeScript)
+
+$probeProcInfo = New-Object System.Diagnostics.ProcessStartInfo
+$probeProcInfo.FileName = $ProtectedPythonExe
+$probeProcInfo.Arguments = $ProbeScriptPath
+$probeProcInfo.UseShellExecute = $false
+$probeProcInfo.CreateNoWindow = $true
+$probeProcInfo.UserName = $RunnerUser
+$probeProcInfo.Password = $RunnerCred.Password
+$probeProcInfo.WorkingDirectory = $ScratchDir
+
+$probeProc = [System.Diagnostics.Process]::Start($probeProcInfo)
+$probeProc.WaitForExit()
+
+$ProbeTarget = "C:\ProgramData\AGYRuntime\agy_runner_write_probe.tmp"
+if (Test-Path $ProbeTarget) {
+    Remove-Item $ProbeTarget -Force
+}
+if ($probeProc.ExitCode -eq 0) { 
+    throw "CRITICAL: AGYRunner was able to modify AGYRuntime. ACL enforcement failed." 
+}
+Remove-Item -Path $ProbeScriptPath -Force
 
 # --- Cryptographic Migration ---
 Write-Host "Handling cryptographic boundary and archiving legacy ledgers..."
