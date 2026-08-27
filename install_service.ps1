@@ -362,23 +362,32 @@ if ($proc.ExitCode -ne 0) { throw "CRITICAL: Runtime self-test AS AGYRunner fail
 
 # --- Cryptographic Migration ---
 Write-Host "Handling cryptographic boundary and archiving legacy ledgers..."
-if (Test-Path "$ProtectedDir\private.pem") { Remove-Item "$ProtectedDir\private.pem" -Force }
-if (Test-Path "$ProtectedDir\worker_secret.key") { Remove-Item "$ProtectedDir\worker_secret.key" -Force }
-if (Test-Path "$ProtectedDir\runner_pwd.txt") { Remove-Item "$ProtectedDir\runner_pwd.txt" -Force }
+$NeedsCryptoRotation = -not (Test-Path "$ProtectedDir\private.pem") -or -not (Test-Path "$ProtectedDir\worker_secret.key")
 
-if (Test-Path "$ProtectedDir\protected_ledger.jsonl") {
-    $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    Write-Host "Archiving legacy ledger to archived_ledger_$Timestamp.jsonl..."
-    Rename-Item -Path "$ProtectedDir\protected_ledger.jsonl" -NewName "archived_ledger_$Timestamp.jsonl"
-    if (Test-Path "$ProtectedDir\public.pem") {
-        Rename-Item -Path "$ProtectedDir\public.pem" -NewName "archived_public_$Timestamp.pem"
+if ($NeedsCryptoRotation) {
+    Write-Host "Generating new cryptographic material..."
+    if (Test-Path "$ProtectedDir\private.pem") { Remove-Item "$ProtectedDir\private.pem" -Force }
+    if (Test-Path "$ProtectedDir\worker_secret.key") { Remove-Item "$ProtectedDir\worker_secret.key" -Force }
+    
+    if (Test-Path "$ProtectedDir\protected_ledger.jsonl") {
+        $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        Write-Host "Archiving legacy ledger to archived_ledger_$Timestamp.jsonl..."
+        Rename-Item -Path "$ProtectedDir\protected_ledger.jsonl" -NewName "archived_ledger_$Timestamp.jsonl"
+        if (Test-Path "$ProtectedDir\public.pem") {
+            Rename-Item -Path "$ProtectedDir\public.pem" -NewName "archived_public_$Timestamp.pem"
+        }
     }
+    
+    Write-Host "Generating new HMAC worker secret..."
+    $SecretBytes = New-Object byte[] 32
+    (New-Object System.Security.Cryptography.RNGCryptoServiceProvider).GetBytes($SecretBytes)
+    [System.IO.File]::WriteAllBytes("$ProtectedDir\worker_secret.key", $SecretBytes)
+} else {
+    Write-Host "Preserving existing Notary key, HMAC secret, and ledger."
 }
 
-Write-Host "Generating new HMAC worker secret and saving runner credentials..."
-$SecretBytes = New-Object byte[] 32
-(New-Object System.Security.Cryptography.RNGCryptoServiceProvider).GetBytes($SecretBytes)
-[System.IO.File]::WriteAllBytes("$ProtectedDir\worker_secret.key", $SecretBytes)
+# Always update the runner password file since we rotated it during user creation
+if (Test-Path "$ProtectedDir\runner_pwd.txt") { Remove-Item "$ProtectedDir\runner_pwd.txt" -Force }
 [System.IO.File]::WriteAllText("$ProtectedDir\runner_pwd.txt", $RunnerPasswordStr)
 
 # --- Binary Deployment ---
