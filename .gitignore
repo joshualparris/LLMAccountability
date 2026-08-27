@@ -4,3 +4,4 @@ agy_verification_audit.jsonl
 .env
 .venv
 venv/
+build/
