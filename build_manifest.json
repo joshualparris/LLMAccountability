@@ -1,0 +1,12 @@
+{
+  "commit_sha": "34ead662f8aacc9285502820cf2f6b122d1148ab",
+  "binaries": {
+    "agy_service.exe": {
+      "sha256": "778F0AFE60C631C6F6304BFB73163DD96AD7A7DE5C579B7B378C8BE765C99B57"
+    },
+    "agy_worker.exe": {
+      "sha256": "2AF1A31E264EAA91F3BC26119113B7D6992D5B4222CDE054524145E9E97D45A8"
+    }
+  },
+  "timestamp": "2026-08-27T14:30:51.5742054+10:00"
+}
