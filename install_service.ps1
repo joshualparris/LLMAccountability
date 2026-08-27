@@ -330,6 +330,10 @@ import cryptography
 import requests
 import yaml
 import typer
+import click
+import fastapi
+import uvicorn
+import httpx
 
 print(sys.version)
 print(pytest.__version__)
@@ -338,6 +342,11 @@ print(pydantic.__version__)
 assert sys.version_info[:2] == (3, 14), f"Python version is {sys.version_info}"
 assert pydantic.__version__ == "2.13.4", f"Pydantic version is {pydantic.__version__}"
 assert pytest.__version__ == "8.2.2", f"Pytest version is {pytest.__version__}"
+assert typer.__version__ == "0.12.3", f"Typer version is {typer.__version__}"
+assert click.__version__ == "8.1.8", f"Click version is {click.__version__}"
+assert fastapi.__version__ == "0.115.8", f"FastAPI version is {fastapi.__version__}"
+assert uvicorn.__version__ == "0.34.0", f"Uvicorn version is {uvicorn.__version__}"
+assert httpx.__version__ == "0.28.1", f"HTTPX version is {httpx.__version__}"
 "@
 
 $RuntimeIsHealthy = $false
@@ -372,7 +381,7 @@ if (-not $RuntimeIsHealthy) {
     Write-Host "Installing dependencies into protected runtime..."
     $ProtectedPip = Join-Path $ProtectedPythonPath "Scripts\pip.exe"
     
-    $proc = Start-Process -FilePath $ProtectedPip -ArgumentList "install", "pytest==8.2.2", "pydantic==2.13.4", "typer==0.12.3", "pyyaml==6.0.1", "cryptography==42.0.8", "requests==2.32.3" -Wait -NoNewWindow -PassThru
+    $proc = Start-Process -FilePath $ProtectedPip -ArgumentList "install", "pytest==8.2.2", "pytest-reportlog==1.0.0", "pydantic==2.13.4", "typer==0.12.3", "click==8.1.8", "pyyaml==6.0.1", "cryptography==42.0.8", "requests==2.32.3", "fastapi==0.115.8", "uvicorn==0.34.0", "httpx==0.28.1" -Wait -NoNewWindow -PassThru
     if ($proc.ExitCode -ne 0) { throw "CRITICAL: Dependency installation failed." }
 }
 
