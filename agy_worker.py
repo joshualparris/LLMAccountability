@@ -89,15 +89,63 @@ $ErrorActionPreference = "Stop"
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
-public class JobObject {{
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
-    [DllImport("kernel32.dll")]
-    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
-    [DllImport("kernel32.dll")]
-    public static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
-    [DllImport("kernel32.dll")]
+public class Launcher {{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {{
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }}
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {{
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }}
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessWithLogonW(
+        string userName, string domain, string password, uint logonFlags,
+        string applicationName, string commandLine, uint creationFlags,
+        IntPtr environment, string currentDirectory,
+        ref STARTUPINFO startupInfo, out PROCESS_INFORMATION processInformation);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern uint ResumeThread(IntPtr hThread);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+    [DllImport("kernel32.dll", SetLastError=true)]
     public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, uint nSize);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetHandleInformation(IntPtr hObject, int dwMask, int dwFlags);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SECURITY_ATTRIBUTES {{
+        public int nLength;
+        public IntPtr lpSecurityDescriptor;
+        public bool bInheritHandle;
+    }}
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
     [StructLayout(LayoutKind.Sequential)]
     public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {{
         public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
@@ -128,55 +176,106 @@ public class JobObject {{
         public ulong WriteTransferCount;
         public ulong OtherTransferCount;
     }}
-    [DllImport("kernel32.dll")]
+    [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION lpJobObjectInfo, uint cbJobObjectInfoLength);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
 }}
 "@
 
-$hJob = [JobObject]::CreateJobObject([IntPtr]::Zero, [string]::Empty)
+$hJob = [Launcher]::CreateJobObject([IntPtr]::Zero, [string]::Empty)
 if ($hJob -eq [IntPtr]::Zero) {{
-    throw "Failed to create Job Object"
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw "Failed to create Job Object, error: $err"
 }}
 
+$limit = New-Object Launcher+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+$limit.BasicLimitInformation.LimitFlags = 0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+$size = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
+$res = [Launcher]::SetInformationJobObject($hJob, 9, [ref]$limit, $size)
+if (-not $res) {{
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::CloseHandle($hJob) | Out-Null
+    throw "Failed to set Job Object information, error: $err"
+}}
+
+$sa = New-Object Launcher+SECURITY_ATTRIBUTES
+$sa.nLength = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+SECURITY_ATTRIBUTES])
+$sa.bInheritHandle = $true
+$sa.lpSecurityDescriptor = [IntPtr]::Zero
+
+$hOutRead = [IntPtr]::Zero
+$hOutWrite = [IntPtr]::Zero
+if (-not [Launcher]::CreatePipe([ref]$hOutRead, [ref]$hOutWrite, [ref]$sa, 0)) {{
+    throw "Failed to create stdout pipe"
+}}
+[Launcher]::SetHandleInformation($hOutRead, 1, 0) | Out-Null
+
+$hErrRead = [IntPtr]::Zero
+$hErrWrite = [IntPtr]::Zero
+if (-not [Launcher]::CreatePipe([ref]$hErrRead, [ref]$hErrWrite, [ref]$sa, 0)) {{
+    throw "Failed to create stderr pipe"
+}}
+[Launcher]::SetHandleInformation($hErrRead, 1, 0) | Out-Null
+
+$si = New-Object Launcher+STARTUPINFO
+$si.cb = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+STARTUPINFO])
+$si.dwFlags = 0x00000100 # STARTF_USESTDHANDLES
+$si.hStdOutput = $hOutWrite
+$si.hStdError = $hErrWrite
+
+$pi = New-Object Launcher+PROCESS_INFORMATION
+$cmdLine = "`"$TargetCmd`" $TargetArgs"
+
+$creationFlags = 0x04000004 # CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_SUSPENDED (0x4)
+# Note: we add CREATE_NO_WINDOW (0x08000000)
+$creationFlags = $creationFlags -bor 0x08000000
+
+$success = [Launcher]::CreateProcessWithLogonW(
+    "AGYRunner", ".", $env:AGY_RUNNER_PWD, 1, # LOGON_WITH_PROFILE
+    $TargetCmd, $cmdLine, $creationFlags, [IntPtr]::Zero, $TargetCwd, [ref]$si, [ref]$pi
+)
+
+if (-not $success) {{
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::CloseHandle($hOutRead) | Out-Null
+    [Launcher]::CloseHandle($hOutWrite) | Out-Null
+    [Launcher]::CloseHandle($hErrRead) | Out-Null
+    [Launcher]::CloseHandle($hErrWrite) | Out-Null
+    [Launcher]::CloseHandle($hJob) | Out-Null
+    throw "CreateProcessWithLogonW failed with error $err"
+}}
+
+$assigned = [Launcher]::AssignProcessToJobObject($hJob, $pi.hProcess)
+if (-not $assigned) {{
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::TerminateProcess($pi.hProcess, 1) | Out-Null
+    throw "AssignProcessToJobObject failed with error $err"
+}}
+
+[Launcher]::ResumeThread($pi.hThread) | Out-Null
+[Launcher]::CloseHandle($pi.hThread) | Out-Null
+[Launcher]::CloseHandle($hOutWrite) | Out-Null
+[Launcher]::CloseHandle($hErrWrite) | Out-Null
+
 try {{
-    $limit = New-Object JobObject+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-    $limit.BasicLimitInformation.LimitFlags = 0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    $size = [System.Runtime.InteropServices.Marshal]::SizeOf([type][JobObject+JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
-    $res = [JobObject]::SetInformationJobObject($hJob, 9, [ref]$limit, $size)
-    if (-not $res) {{
-        throw "Failed to set Job Object information"
-    }}
+    $outSafe = New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($hOutRead, $true)
+    $outStream = New-Object System.IO.FileStream($outSafe, [System.IO.FileAccess]::Read)
+    $outReader = New-Object System.IO.StreamReader($outStream)
+    $outTask = $outReader.ReadToEndAsync()
 
-    $secStr = ConvertTo-SecureString $env:AGY_RUNNER_PWD -AsPlainText -Force
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $TargetCmd
-    $psi.Arguments = $TargetArgs
-    $psi.UserName = "AGYRunner"
-    $psi.Password = $secStr
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.WorkingDirectory = $TargetCwd
-    $psi.CreateNoWindow = $true
-
-    $p = [System.Diagnostics.Process]::Start($psi)
-    
-    # Assign process to job immediately to ensure child containment
-    $assigned = [JobObject]::AssignProcessToJobObject($hJob, $p.Handle)
-    if (-not $assigned) {{
-        [JobObject]::TerminateJobObject($hJob, 1) | Out-Null
-        $p.Kill()
-        throw "Failed to assign process to Job Object"
-    }}
-
-    $outTask = $p.StandardOutput.ReadToEndAsync()
-    $errTask = $p.StandardError.ReadToEndAsync()
+    $errSafe = New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($hErrRead, $true)
+    $errStream = New-Object System.IO.FileStream($errSafe, [System.IO.FileAccess]::Read)
+    $errReader = New-Object System.IO.StreamReader($errStream)
+    $errTask = $errReader.ReadToEndAsync()
     
     $timeoutMs = {timeout * 1000}
-    $exited = $p.WaitForExit($timeoutMs)
-    if (-not $exited) {{
-        # Terminate the entire job object
-        [JobObject]::TerminateJobObject($hJob, 1) | Out-Null
+    $waitRes = [Launcher]::WaitForSingleObject($pi.hProcess, $timeoutMs)
+    
+    if ($waitRes -eq 0x102) {{ # WAIT_TIMEOUT
+        [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
         $result = @{{
             ExitCode = -1
             Stdout = ""
@@ -190,8 +289,11 @@ try {{
     
     [System.Threading.Tasks.Task]::WaitAll($outTask, $errTask)
     
+    $exitCode = 0
+    [Launcher]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode) | Out-Null
+    
     $result = @{{
-        ExitCode = $p.ExitCode
+        ExitCode = $exitCode
         Stdout = $outTask.Result
         Stderr = $errTask.Result
         SpawnError = ""
@@ -202,7 +304,8 @@ try {{
     $err = @{{ ExitCode = -1; Stdout = ""; Stderr = ""; SpawnError = $_.Exception.Message; TimedOut = $false }}
     $err | ConvertTo-Json -Compress
 }} finally {{
-    [JobObject]::CloseHandle($hJob) | Out-Null
+    [Launcher]::CloseHandle($pi.hProcess) | Out-Null
+    [Launcher]::CloseHandle($hJob) | Out-Null
 }}
 """
     with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
