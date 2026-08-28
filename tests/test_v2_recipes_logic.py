@@ -125,7 +125,7 @@ def test_tests_recipe_fingerprint_toctou(monkeypatch, tmp_path):
     (repo / "test.py").write_text("print('test')")
     
     # Mock run_as_runner to simulate the test running AND the source changing during execution
-    def mock_run(cmd, cwd):
+    def mock_run(cmd, cwd, **kwargs):
         # simulate modifying the workspace
         (repo / "test.py").write_text("print('hacked')")
         return {"exit_code": 0, "stdout": b"test passed", "stderr": b"", "spawn_error": None}
@@ -194,7 +194,7 @@ def test_tests_recipe_fingerprint_stable(monkeypatch, tmp_path):
     repo.mkdir()
     (repo / "test.py").write_text("print('test')")
     
-    def mock_run(cmd, cwd):
+    def mock_run(cmd, cwd, **kwargs):
         return {"exit_code": 0, "stdout": b"test passed", "stderr": b"", "spawn_error": None}
         
     monkeypatch.setattr(agy_worker, "run_as_runner", mock_run)

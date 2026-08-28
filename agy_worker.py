@@ -69,7 +69,7 @@ def sanitize_diagnostic(text: str) -> str:
         
     return text[:1000]
 
-def run_as_runner(cmd: list, cwd: str) -> dict:
+def run_as_runner(cmd: list, cwd: str, timeout: int = 120) -> dict:
     if not os.path.exists(RUNNER_PWD_PATH):
         raise RuntimeError("Runner credentials not found. Trust boundary incomplete.")
         
@@ -78,42 +78,132 @@ def run_as_runner(cmd: list, cwd: str) -> dict:
         
     args_str = " ".join(f'"{arg}"' if ' ' in arg else arg for arg in cmd[1:])
     
-    script = """
+    script = f"""
 param(
     [string]$TargetCmd,
     [string]$TargetArgs,
     [string]$TargetCwd
 )
 $ErrorActionPreference = "Stop"
-$secStr = ConvertTo-SecureString $env:AGY_RUNNER_PWD -AsPlainText -Force
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $TargetCmd
-$psi.Arguments = $TargetArgs
-$psi.UserName = "AGYRunner"
-$psi.Password = $secStr
-$psi.UseShellExecute = $false
-$psi.RedirectStandardOutput = $true
-$psi.RedirectStandardError = $true
-$psi.WorkingDirectory = $TargetCwd
-$psi.CreateNoWindow = $true
 
-try {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class JobObject {{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+    [DllImport("kernel32.dll")]
+    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+    [DllImport("kernel32.dll")]
+    public static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {{
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public JOBOBJECT_IO_ACCOUNTING_INFO IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }}
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {{
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }}
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_IO_ACCOUNTING_INFO {{
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }}
+    [DllImport("kernel32.dll")]
+    public static extern bool SetInformationJobObject(IntPtr hJob, int JobObjectInfoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION lpJobObjectInfo, uint cbJobObjectInfoLength);
+}}
+"@
+
+$hJob = [JobObject]::CreateJobObject([IntPtr]::Zero, [string]::Empty)
+if ($hJob -eq [IntPtr]::Zero) {{
+    throw "Failed to create Job Object"
+}}
+
+try {{
+    $limit = New-Object JobObject+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    $limit.BasicLimitInformation.LimitFlags = 0x2000 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    $size = [System.Runtime.InteropServices.Marshal]::SizeOf([type][JobObject+JOBOBJECT_EXTENDED_LIMIT_INFORMATION])
+    $res = [JobObject]::SetInformationJobObject($hJob, 9, [ref]$limit, $size)
+    if (-not $res) {{
+        throw "Failed to set Job Object information"
+    }}
+
+    $secStr = ConvertTo-SecureString $env:AGY_RUNNER_PWD -AsPlainText -Force
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $TargetCmd
+    $psi.Arguments = $TargetArgs
+    $psi.UserName = "AGYRunner"
+    $psi.Password = $secStr
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = $TargetCwd
+    $psi.CreateNoWindow = $true
+
     $p = [System.Diagnostics.Process]::Start($psi)
-    $p.WaitForExit()
-    $stdout = $p.StandardOutput.ReadToEnd()
-    $stderr = $p.StandardError.ReadToEnd()
     
-    $result = @{
+    # Assign process to job immediately to ensure child containment
+    $assigned = [JobObject]::AssignProcessToJobObject($hJob, $p.Handle)
+    if (-not $assigned) {{
+        [JobObject]::TerminateJobObject($hJob, 1) | Out-Null
+        $p.Kill()
+        throw "Failed to assign process to Job Object"
+    }}
+
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    
+    $timeoutMs = {timeout * 1000}
+    $exited = $p.WaitForExit($timeoutMs)
+    if (-not $exited) {{
+        # Terminate the entire job object
+        [JobObject]::TerminateJobObject($hJob, 1) | Out-Null
+        $result = @{{
+            ExitCode = -1
+            Stdout = ""
+            Stderr = ""
+            SpawnError = ""
+            TimedOut = $true
+        }}
+        $result | ConvertTo-Json -Compress
+        exit 0
+    }}
+    
+    [System.Threading.Tasks.Task]::WaitAll($outTask, $errTask)
+    
+    $result = @{{
         ExitCode = $p.ExitCode
-        Stdout = $stdout
-        Stderr = $stderr
+        Stdout = $outTask.Result
+        Stderr = $errTask.Result
         SpawnError = ""
-    }
+        TimedOut = $false
+    }}
     $result | ConvertTo-Json -Compress
-} catch {
-    $err = @{ ExitCode = -1; Stdout = ""; Stderr = ""; SpawnError = $_.Exception.Message }
+}} catch {{
+    $err = @{{ ExitCode = -1; Stdout = ""; Stderr = ""; SpawnError = $_.Exception.Message; TimedOut = $false }}
     $err | ConvertTo-Json -Compress
-}
+}} finally {{
+    [JobObject]::CloseHandle($hJob) | Out-Null
+}}
 """
     with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
         f.write(script)
@@ -125,10 +215,10 @@ try {
         res = subprocess.run(
             ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path, 
              "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", cwd], 
-            capture_output=True, text=True, env=env
+            capture_output=True, text=True, env=env, timeout=timeout + 30
         )
         if res.returncode != 0 and not res.stdout.strip():
-            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell failure: {res.stderr}"}
+            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell failure: {res.stderr}", "timed_out": False}
             
         try:
             out_json = json.loads(res.stdout.strip())
@@ -136,15 +226,18 @@ try {
                 "exit_code": out_json.get("ExitCode", -1),
                 "stdout": out_json.get("Stdout", ""),
                 "stderr": out_json.get("Stderr", ""),
-                "spawn_error": out_json.get("SpawnError", "")
+                "spawn_error": out_json.get("SpawnError", ""),
+                "timed_out": out_json.get("TimedOut", False)
             }
         except json.JSONDecodeError:
-            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell decode failure: {res.stdout.strip()} {res.stderr.strip()}"}
-    except Exception as e:
-        return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": str(e)}
+            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell decode failure: {res.stdout.strip()} {res.stderr.strip()}", "timed_out": False}
+    except subprocess.TimeoutExpired:
+        return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": "Python subprocess timed out waiting for PowerShell wrapper", "timed_out": True}
     finally:
-        if os.path.exists(script_path):
+        try:
             os.remove(script_path)
+        except Exception:
+            pass
 
 def get_file_sha256(filepath: str) -> str:
     if not os.path.exists(filepath):
@@ -294,7 +387,8 @@ def execute(req: ExecuteRequest):
             if req.profile == "python-full":
                 os.environ["PYTHONPATH"] = os.path.join(repo_path, "src")
                 
-            res = run_as_runner(cmd, repo_path)
+            timeout = 300 if req.profile == "python-full" else 120
+            res = run_as_runner(cmd, repo_path, timeout=timeout)
             
             fp_after, fp_count_after = _workspace_fingerprint(repo_path)
             
@@ -309,11 +403,17 @@ def execute(req: ExecuteRequest):
             evidence["exit_code"] = res["exit_code"]
             evidence["stdout_snippet"] = sanitize_diagnostic(res["stdout"])
             evidence["stderr_snippet"] = sanitize_diagnostic(res["stderr"])
+            
+            if res.get("timed_out", False):
+                evidence["timed_out"] = True
+                evidence["diagnostic_reason"] = "test execution timed out"
+                
             if res["spawn_error"]:
                 evidence["spawn_error"] = sanitize_diagnostic(res["spawn_error"])
-                evidence["diagnostic_reason"] = sanitize_diagnostic("failed to spawn tests")
+                if "diagnostic_reason" not in evidence:
+                    evidence["diagnostic_reason"] = sanitize_diagnostic("failed to spawn tests")
                 
-            if req.profile == "python-full":
+            if req.profile == "python-full" and not evidence.get("timed_out", False) and "diagnostic_reason" not in evidence:
                 if not os.path.exists(report_path) or os.path.getsize(report_path) == 0:
                     evidence["diagnostic_reason"] = "pytest report log missing or empty"
                 else:
