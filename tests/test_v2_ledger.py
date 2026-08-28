@@ -111,6 +111,19 @@ def test_ledger_real_crypto(tmp_path):
             ledger_path.write_text(json.dumps(r3) + "\n")
             with pytest.raises(RuntimeError, match="Missing signature"):
                 agy_service.validate_ledger()
+                
+            # 5. correct signature, but wrong public key
+            r4 = json.loads(lines[0])
+            wrong_priv = ed25519.Ed25519PrivateKey.generate()
+            wrong_pub = wrong_priv.public_key()
+            wrong_pub_pem = wrong_pub.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
+            
+            wrong_pub_path = tmp_path / "wrong_public.pem"
+            wrong_pub_path.write_bytes(wrong_pub_pem)
+            with patch("agy_service.PUB_KEY_PATH", str(wrong_pub_path)):
+                ledger_path.write_text(json.dumps(r4) + "\n")
+                with pytest.raises(RuntimeError, match="Invalid cryptographic signature"):
+                    agy_service.validate_ledger()
 
 def test_service_level_tamper_fails_closed(tmp_path):
     import json

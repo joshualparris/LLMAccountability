@@ -5,7 +5,7 @@ import time
 import sys
 import os
 
-def run_ps1_wrapper(cmd: list[str], timeout: int = 5, env: dict = None) -> dict:
+def run_ps1_wrapper(cmd: list[str], timeout: int = 5, env: dict = None, outer_timeout: int = None) -> dict:
     import json
     import os
     import subprocess
@@ -323,49 +323,62 @@ try {{
     }}
 }}
 '''
-    with open("temp_test.ps1", "w") as f:
+    import tempfile
+    fd, temp_script_path = tempfile.mkstemp(suffix=".ps1", text=True)
+    with os.fdopen(fd, "w") as f:
         f.write(script)
-        
-    res = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", "temp_test.ps1", "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", os.path.abspath("."), "-TargetEnvJson", env_json], capture_output=True, text=True, timeout=timeout+10)
-    os.remove("temp_test.ps1")
     try:
-        return json.loads(res.stdout.strip())
-    except json.JSONDecodeError:
-        print(f"STDOUT: {res.stdout}")
-        print(f"STDERR: {res.stderr}")
-        raise
+        res = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", temp_script_path, "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", os.path.abspath("."), "-TargetEnvJson", env_json], capture_output=True, text=True, timeout=outer_timeout if outer_timeout is not None else timeout + 10)
+        try:
+            out_json = json.loads(res.stdout.strip())
+            return {
+                "exit_code": out_json.get("ExitCode", -1),
+                "stdout": out_json.get("Stdout", ""),
+                "stderr": out_json.get("Stderr", ""),
+                "spawn_error": out_json.get("SpawnError", ""),
+                "timed_out": out_json.get("TimedOut", False)
+            }
+        except json.JSONDecodeError:
+            print(f"STDOUT: {res.stdout}")
+            print(f"STDERR: {res.stderr}")
+            raise
+    except subprocess.TimeoutExpired:
+        return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": "Python subprocess timed out waiting for PowerShell wrapper", "timed_out": True}
+    finally:
+        if os.path.exists(temp_script_path):
+            os.remove(temp_script_path)
 
 def test_runner_normal():
     res = run_ps1_wrapper([sys.executable, "-c", "print('hello')"])
-    assert res["ExitCode"] == 0
-    assert res["Stdout"] == "hello\r\n"
-    assert res["Stderr"] == ""
-    assert res["TimedOut"] is False
+    assert res["exit_code"] == 0
+    assert res["stdout"] == "hello\r\n"
+    assert res["stderr"] == ""
+    assert res["timed_out"] is False
 
 def test_runner_stdout_heavy():
     res = run_ps1_wrapper([sys.executable, "-c", "print('A' * 100000)"])
-    assert res["ExitCode"] == 0
-    assert len(res["Stdout"]) >= 100000
-    assert res["TimedOut"] is False
+    assert res["exit_code"] == 0
+    assert len(res["stdout"]) >= 100000
+    assert res["timed_out"] is False
 
 def test_runner_stderr_heavy():
     res = run_ps1_wrapper([sys.executable, "-c", "import sys; sys.stderr.write('B' * 100000)"])
-    assert res["ExitCode"] == 0
-    assert len(res["Stderr"]) >= 100000
-    assert res["TimedOut"] is False
+    assert res["exit_code"] == 0
+    assert len(res["stderr"]) >= 100000
+    assert res["timed_out"] is False
 
 def test_runner_both_heavy():
     res = run_ps1_wrapper([sys.executable, "-c", "import sys; print('A' * 100000); sys.stderr.write('B' * 100000)"])
-    assert res["ExitCode"] == 0
-    assert len(res["Stdout"]) >= 100000
-    assert len(res["Stderr"]) >= 100000
-    assert res["TimedOut"] is False
+    assert res["exit_code"] == 0
+    assert len(res["stdout"]) >= 100000
+    assert len(res["stderr"]) >= 100000
+    assert res["timed_out"] is False
 
 def test_runner_timeout_kills_child():
     res = run_ps1_wrapper([sys.executable, "-c", "import time; time.sleep(10)"], timeout=1)
     
-    assert res["ExitCode"] == -1
-    assert res["TimedOut"] is True
+    assert res["exit_code"] == -1
+    assert res["timed_out"] is True
 
 def test_runner_timeout_kills_descendants():
     # Spawn a control process that should NOT be killed
@@ -390,7 +403,7 @@ time.sleep(20)
     res = run_ps1_wrapper([sys.executable, "child.py"], timeout=3)
     
     # Verify timeout occurred
-    assert res["TimedOut"] is True
+    assert res["timed_out"] is True
     
     # Verify the PIDs were recorded
     assert os.path.exists("pids.txt")
@@ -442,7 +455,7 @@ time.sleep(30)
         
     res = run_ps1_wrapper([sys.executable, "race_child.py"], timeout=3)
     
-    assert res["TimedOut"] is True
+    assert res["timed_out"] is True
     
     # Read the PIDs
     assert os.path.exists("race_pids.txt")
@@ -495,7 +508,7 @@ sys.stdout.flush()
         
     res = run_as_runner([sys.executable, "runner_child.py"], timeout=5, cwd=os.path.abspath("."), env={"TEST_ENV": "1"})
     
-    assert res["ExitCode"] == 0
-    assert "hello from runner" in res["Stdout"]
+    assert res["exit_code"] == 0
+    assert "hello from runner" in res["stdout"]
     
     os.remove("runner_child.py")
