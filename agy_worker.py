@@ -69,27 +69,47 @@ def sanitize_diagnostic(text: str) -> str:
         
     return text[:1000]
 
-def run_as_runner(cmd: list, cwd: str, timeout: int = 120) -> dict:
-    if not os.path.exists(RUNNER_PWD_PATH):
-        raise RuntimeError("Runner credentials not found. Trust boundary incomplete.")
-        
-    with open(RUNNER_PWD_PATH, "r") as f:
-        pwd = f.read().strip()
-        
-    args_str = " ".join(f'"{arg}"' if ' ' in arg else arg for arg in cmd[1:])
+def run_as_runner(cmd: list[str], timeout: int, cwd: str, env: dict = None) -> dict:
+    import json
+    import os
+    import subprocess
+    import tempfile
     
-    script = f"""
+    if not os.path.exists(RUNNER_PWD_PATH):
+        return {"ExitCode": -1, "Stdout": "", "Stderr": "", "SpawnError": "Runner credentials not found", "TimedOut": False}
+    with open(RUNNER_PWD_PATH, "r") as f:
+        AGY_RUNNER_PWD = f.read().strip()
+
+    env_json = json.dumps(env or {})
+    
+    # We must properly escape arguments that contain spaces
+    def escape_arg(arg: str) -> str:
+        if ' ' in arg or '"' in arg:
+            escaped = arg.replace('"', '\\"')
+            return f'"{escaped}"'
+        return arg
+        
+    args_str = " ".join(escape_arg(arg) for arg in cmd[1:])
+    
+    script = f'''
 param(
     [string]$TargetCmd,
     [string]$TargetArgs,
-    [string]$TargetCwd
+    [string]$TargetCwd,
+    [string]$TargetEnvJson
 )
 $ErrorActionPreference = "Stop"
 
 Add-Type -TypeDefinition @"
 using System;
+using System.Text;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public class Launcher {{
+    public const uint CREATE_SUSPENDED = 0x00000004;
+    public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    public const uint CREATE_NO_WINDOW = 0x08000000;
+    
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct STARTUPINFO {{
         public int cb;
@@ -182,6 +202,24 @@ public class Launcher {{
     public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+    public static IntPtr BuildEnvironmentBlock(Dictionary<string, string> env) {{
+        if (env == null || env.Count == 0) return IntPtr.Zero;
+        List<string> vars = new List<string>();
+        foreach (var kvp in env) {{
+            vars.Add(kvp.Key + "=" + kvp.Value);
+        }}
+        vars.Sort(StringComparer.OrdinalIgnoreCase);
+        StringBuilder sb = new StringBuilder();
+        foreach (string s in vars) {{
+            sb.Append(s).Append('\\0');
+        }}
+        sb.Append('\\0');
+        byte[] bytes = Encoding.Unicode.GetBytes(sb.ToString());
+        IntPtr ptr = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, ptr, bytes.Length);
+        return ptr;
+    }}
 }}
 "@
 
@@ -206,40 +244,67 @@ $sa.nLength = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+S
 $sa.bInheritHandle = $true
 $sa.lpSecurityDescriptor = [IntPtr]::Zero
 
+$hInRead = [IntPtr]::Zero
+$hInWrite = [IntPtr]::Zero
+if (-not [Launcher]::CreatePipe([ref]$hInRead, [ref]$hInWrite, [ref]$sa, 0)) {{
+    throw "Failed to create stdin pipe"
+}}
+if (-not [Launcher]::SetHandleInformation($hInWrite, 1, 0)) {{
+    throw "Failed to SetHandleInformation on stdin"
+}}
+[Launcher]::CloseHandle($hInWrite) | Out-Null
+
 $hOutRead = [IntPtr]::Zero
 $hOutWrite = [IntPtr]::Zero
 if (-not [Launcher]::CreatePipe([ref]$hOutRead, [ref]$hOutWrite, [ref]$sa, 0)) {{
     throw "Failed to create stdout pipe"
 }}
-[Launcher]::SetHandleInformation($hOutRead, 1, 0) | Out-Null
+if (-not [Launcher]::SetHandleInformation($hOutRead, 1, 0)) {{
+    throw "Failed to SetHandleInformation on stdout"
+}}
 
 $hErrRead = [IntPtr]::Zero
 $hErrWrite = [IntPtr]::Zero
 if (-not [Launcher]::CreatePipe([ref]$hErrRead, [ref]$hErrWrite, [ref]$sa, 0)) {{
     throw "Failed to create stderr pipe"
 }}
-[Launcher]::SetHandleInformation($hErrRead, 1, 0) | Out-Null
+if (-not [Launcher]::SetHandleInformation($hErrRead, 1, 0)) {{
+    throw "Failed to SetHandleInformation on stderr"
+}}
 
 $si = New-Object Launcher+STARTUPINFO
 $si.cb = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+STARTUPINFO])
 $si.dwFlags = 0x00000100 # STARTF_USESTDHANDLES
+$si.hStdInput = $hInRead
 $si.hStdOutput = $hOutWrite
 $si.hStdError = $hErrWrite
 
 $pi = New-Object Launcher+PROCESS_INFORMATION
 $cmdLine = "`"$TargetCmd`" $TargetArgs"
 
-$creationFlags = 0x04000004 # CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_SUSPENDED (0x4)
-# Note: we add CREATE_NO_WINDOW (0x08000000)
-$creationFlags = $creationFlags -bor 0x08000000
+$creationFlags = [Launcher]::CREATE_UNICODE_ENVIRONMENT -bor [Launcher]::CREATE_SUSPENDED -bor [Launcher]::CREATE_NO_WINDOW
+
+$envDict = New-Object "System.Collections.Generic.Dictionary[string,string]"
+$envObj = $TargetEnvJson | ConvertFrom-Json
+if ($envObj) {{
+    foreach ($prop in $envObj.psobject.properties) {{
+        $envDict[$prop.Name] = [string]$prop.Value
+    }}
+}}
+$envPtr = [Launcher]::BuildEnvironmentBlock($envDict)
 
 $success = [Launcher]::CreateProcessWithLogonW(
     "AGYRunner", ".", $env:AGY_RUNNER_PWD, 1, # LOGON_WITH_PROFILE
-    $TargetCmd, $cmdLine, $creationFlags, [IntPtr]::Zero, $TargetCwd, [ref]$si, [ref]$pi
+    $TargetCmd, $cmdLine, $creationFlags, $envPtr, $TargetCwd, [ref]$si, [ref]$pi
 )
+
+if ($envPtr -ne [IntPtr]::Zero) {{
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($envPtr)
+}}
 
 if (-not $success) {{
     $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::CloseHandle($hInRead) | Out-Null
     [Launcher]::CloseHandle($hOutRead) | Out-Null
     [Launcher]::CloseHandle($hOutWrite) | Out-Null
     [Launcher]::CloseHandle($hErrRead) | Out-Null
@@ -255,8 +320,15 @@ if (-not $assigned) {{
     throw "AssignProcessToJobObject failed with error $err"
 }}
 
-[Launcher]::ResumeThread($pi.hThread) | Out-Null
+$resumeRes = [Launcher]::ResumeThread($pi.hThread)
+if ($resumeRes -eq 0xFFFFFFFF) {{
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
+    throw "ResumeThread failed with error $err"
+}}
+
 [Launcher]::CloseHandle($pi.hThread) | Out-Null
+[Launcher]::CloseHandle($hInRead) | Out-Null
 [Launcher]::CloseHandle($hOutWrite) | Out-Null
 [Launcher]::CloseHandle($hErrWrite) | Out-Null
 
@@ -275,7 +347,10 @@ try {{
     $waitRes = [Launcher]::WaitForSingleObject($pi.hProcess, $timeoutMs)
     
     if ($waitRes -eq 0x102) {{ # WAIT_TIMEOUT
-        [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
+        if (-not [Launcher]::TerminateJobObject($hJob, 1)) {{
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "TerminateJobObject failed on timeout with error $err"
+        }}
         $result = @{{
             ExitCode = -1
             Stdout = ""
@@ -286,11 +361,19 @@ try {{
         $result | ConvertTo-Json -Compress
         exit 0
     }}
+    elseif ($waitRes -ne 0) {{ # WAIT_OBJECT_0 is 0
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
+        throw "WaitForSingleObject failed abnormally: $waitRes (error $err)"
+    }}
     
     [System.Threading.Tasks.Task]::WaitAll($outTask, $errTask)
     
     $exitCode = 0
-    [Launcher]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode) | Out-Null
+    if (-not [Launcher]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode)) {{
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "GetExitCodeProcess failed with error $err"
+    }}
     
     $result = @{{
         ExitCode = $exitCode
@@ -305,35 +388,28 @@ try {{
     $err | ConvertTo-Json -Compress
 }} finally {{
     [Launcher]::CloseHandle($pi.hProcess) | Out-Null
-    [Launcher]::CloseHandle($hJob) | Out-Null
+    if ($hJob -ne [IntPtr]::Zero) {{
+        [Launcher]::CloseHandle($hJob) | Out-Null
+    }}
 }}
-"""
-    with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False, mode="w") as f:
+'''
+    with open("temp.ps1", "w") as f:
         f.write(script)
-        script_path = f.name
         
+    res = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", "temp.ps1", "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", cwd, "-TargetEnvJson", env_json], capture_output=True, text=True, timeout=timeout+10)
+    os.remove("temp.ps1")
+    
     try:
-        env = os.environ.copy()
-        env["AGY_RUNNER_PWD"] = pwd
-        res = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", script_path, 
-             "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", cwd], 
-            capture_output=True, text=True, env=env, timeout=timeout + 30
-        )
-        if res.returncode != 0 and not res.stdout.strip():
-            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell failure: {res.stderr}", "timed_out": False}
-            
-        try:
-            out_json = json.loads(res.stdout.strip())
-            return {
-                "exit_code": out_json.get("ExitCode", -1),
-                "stdout": out_json.get("Stdout", ""),
-                "stderr": out_json.get("Stderr", ""),
-                "spawn_error": out_json.get("SpawnError", ""),
-                "timed_out": out_json.get("TimedOut", False)
-            }
-        except json.JSONDecodeError:
-            return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell decode failure: {res.stdout.strip()} {res.stderr.strip()}", "timed_out": False}
+        out_json = json.loads(res.stdout.strip())
+        return {
+            "exit_code": out_json.get("ExitCode", -1),
+            "stdout": out_json.get("Stdout", ""),
+            "stderr": out_json.get("Stderr", ""),
+            "spawn_error": out_json.get("SpawnError", ""),
+            "timed_out": out_json.get("TimedOut", False)
+        }
+    except json.JSONDecodeError:
+        return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": f"PowerShell decode failure: {res.stdout.strip()} {res.stderr.strip()}", "timed_out": False}
     except subprocess.TimeoutExpired:
         return {"exit_code": -1, "stdout": "", "stderr": "", "spawn_error": "Python subprocess timed out waiting for PowerShell wrapper", "timed_out": True}
     finally:
@@ -485,13 +561,19 @@ def execute(req: ExecuteRequest):
             
             fp_before, fp_count_before = _workspace_fingerprint(repo_path)
             
-            # Set PYTHONDONTWRITEBYTECODE=1 in the worker environment so it inherits to the runner script
-            os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+            safe_env = {
+                "SystemRoot": os.environ.get("SystemRoot", "C:\\Windows"),
+                "WINDIR": os.environ.get("WINDIR", "C:\\Windows"),
+                "SystemDrive": os.environ.get("SystemDrive", "C:"),
+                "TEMP": scratch_base,
+                "TMP": scratch_base,
+                "PYTHONDONTWRITEBYTECODE": "1"
+            }
             if req.profile == "python-full":
-                os.environ["PYTHONPATH"] = os.path.join(repo_path, "src")
+                safe_env["PYTHONPATH"] = os.path.join(repo_path, "src")
                 
             timeout = 300 if req.profile == "python-full" else 120
-            res = run_as_runner(cmd, repo_path, timeout=timeout)
+            res = run_as_runner(cmd, timeout=timeout, cwd=repo_path, env=safe_env)
             
             fp_after, fp_count_after = _workspace_fingerprint(repo_path)
             

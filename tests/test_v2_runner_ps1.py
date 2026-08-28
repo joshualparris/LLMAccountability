@@ -5,21 +5,41 @@ import time
 import sys
 import os
 
-def run_ps1_wrapper(cmd, timeout=2):
-    args_str = " ".join(f'"{arg}"' if ' ' in arg else arg for arg in cmd[1:])
+def run_ps1_wrapper(cmd: list[str], timeout: int = 5, env: dict = None) -> dict:
+    import json
+    import os
+    import subprocess
+    import sys
+    
+    env_json = json.dumps(env or {})
+    
+    def escape_arg(arg: str) -> str:
+        if ' ' in arg or '"' in arg:
+            escaped = arg.replace('"', '\\"')
+            return f'"{escaped}"'
+        return arg
+        
+    args_str = " ".join(escape_arg(arg) for arg in cmd[1:])
     
     script = f'''
 param(
     [string]$TargetCmd,
     [string]$TargetArgs,
-    [string]$TargetCwd
+    [string]$TargetCwd,
+    [string]$TargetEnvJson
 )
 $ErrorActionPreference = "Stop"
 
 Add-Type -TypeDefinition @"
 using System;
+using System.Text;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public class Launcher {{
+    public const uint CREATE_SUSPENDED = 0x00000004;
+    public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    public const uint CREATE_NO_WINDOW = 0x08000000;
+    
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct STARTUPINFO {{
         public int cb;
@@ -112,6 +132,24 @@ public class Launcher {{
     public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+    public static IntPtr BuildEnvironmentBlock(Dictionary<string, string> env) {{
+        if (env == null || env.Count == 0) return IntPtr.Zero;
+        List<string> vars = new List<string>();
+        foreach (var kvp in env) {{
+            vars.Add(kvp.Key + "=" + kvp.Value);
+        }}
+        vars.Sort(StringComparer.OrdinalIgnoreCase);
+        StringBuilder sb = new StringBuilder();
+        foreach (string s in vars) {{
+            sb.Append(s).Append('\\0');
+        }}
+        sb.Append('\\0');
+        byte[] bytes = Encoding.Unicode.GetBytes(sb.ToString());
+        IntPtr ptr = Marshal.AllocHGlobal(bytes.Length);
+        Marshal.Copy(bytes, 0, ptr, bytes.Length);
+        return ptr;
+    }}
 }}
 "@
 
@@ -136,39 +174,67 @@ $sa.nLength = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+S
 $sa.bInheritHandle = $true
 $sa.lpSecurityDescriptor = [IntPtr]::Zero
 
+$hInRead = [IntPtr]::Zero
+$hInWrite = [IntPtr]::Zero
+if (-not [Launcher]::CreatePipe([ref]$hInRead, [ref]$hInWrite, [ref]$sa, 0)) {{
+    throw "Failed to create stdin pipe"
+}}
+if (-not [Launcher]::SetHandleInformation($hInWrite, 1, 0)) {{
+    throw "Failed to SetHandleInformation on stdin"
+}}
+[Launcher]::CloseHandle($hInWrite) | Out-Null
+
 $hOutRead = [IntPtr]::Zero
 $hOutWrite = [IntPtr]::Zero
 if (-not [Launcher]::CreatePipe([ref]$hOutRead, [ref]$hOutWrite, [ref]$sa, 0)) {{
     throw "Failed to create stdout pipe"
 }}
-[Launcher]::SetHandleInformation($hOutRead, 1, 0) | Out-Null
+if (-not [Launcher]::SetHandleInformation($hOutRead, 1, 0)) {{
+    throw "Failed to SetHandleInformation on stdout"
+}}
 
 $hErrRead = [IntPtr]::Zero
 $hErrWrite = [IntPtr]::Zero
 if (-not [Launcher]::CreatePipe([ref]$hErrRead, [ref]$hErrWrite, [ref]$sa, 0)) {{
     throw "Failed to create stderr pipe"
 }}
-[Launcher]::SetHandleInformation($hErrRead, 1, 0) | Out-Null
+if (-not [Launcher]::SetHandleInformation($hErrRead, 1, 0)) {{
+    throw "Failed to SetHandleInformation on stderr"
+}}
 
 $si = New-Object Launcher+STARTUPINFO
 $si.cb = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Launcher+STARTUPINFO])
 $si.dwFlags = 0x00000100 # STARTF_USESTDHANDLES
+$si.hStdInput = $hInRead
 $si.hStdOutput = $hOutWrite
 $si.hStdError = $hErrWrite
 
 $pi = New-Object Launcher+PROCESS_INFORMATION
 $cmdLine = "`"$TargetCmd`" $TargetArgs"
 
-$creationFlags = 0x04000004 # CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_SUSPENDED (0x4)
-$creationFlags = $creationFlags -bor 0x08000000 # CREATE_NO_WINDOW
+$creationFlags = [Launcher]::CREATE_UNICODE_ENVIRONMENT -bor [Launcher]::CREATE_SUSPENDED -bor [Launcher]::CREATE_NO_WINDOW
+
+$envDict = New-Object "System.Collections.Generic.Dictionary[string,string]"
+$envObj = $TargetEnvJson | ConvertFrom-Json
+if ($envObj) {{
+    foreach ($prop in $envObj.psobject.properties) {{
+        $envDict[$prop.Name] = [string]$prop.Value
+    }}
+}}
+$envPtr = [Launcher]::BuildEnvironmentBlock($envDict)
 
 $success = [Launcher]::CreateProcessW(
     $TargetCmd, $cmdLine, [IntPtr]::Zero, [IntPtr]::Zero, $true,
-    $creationFlags, [IntPtr]::Zero, $TargetCwd, [ref]$si, [ref]$pi
+    $creationFlags, $envPtr, $TargetCwd, [ref]$si, [ref]$pi
 )
+
+if ($envPtr -ne [IntPtr]::Zero) {{
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($envPtr)
+}}
 
 if (-not $success) {{
     $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::CloseHandle($hInRead) | Out-Null
     [Launcher]::CloseHandle($hOutRead) | Out-Null
     [Launcher]::CloseHandle($hOutWrite) | Out-Null
     [Launcher]::CloseHandle($hErrRead) | Out-Null
@@ -184,8 +250,15 @@ if (-not $assigned) {{
     throw "AssignProcessToJobObject failed with error $err"
 }}
 
-[Launcher]::ResumeThread($pi.hThread) | Out-Null
+$resumeRes = [Launcher]::ResumeThread($pi.hThread)
+if ($resumeRes -eq 0xFFFFFFFF) {{
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
+    throw "ResumeThread failed with error $err"
+}}
+
 [Launcher]::CloseHandle($pi.hThread) | Out-Null
+[Launcher]::CloseHandle($hInRead) | Out-Null
 [Launcher]::CloseHandle($hOutWrite) | Out-Null
 [Launcher]::CloseHandle($hErrWrite) | Out-Null
 
@@ -204,7 +277,10 @@ try {{
     $waitRes = [Launcher]::WaitForSingleObject($pi.hProcess, $timeoutMs)
     
     if ($waitRes -eq 0x102) {{ # WAIT_TIMEOUT
-        [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
+        if (-not [Launcher]::TerminateJobObject($hJob, 1)) {{
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "TerminateJobObject failed on timeout with error $err"
+        }}
         $result = @{{
             ExitCode = -1
             Stdout = ""
@@ -215,11 +291,19 @@ try {{
         $result | ConvertTo-Json -Compress
         exit 0
     }}
+    elseif ($waitRes -ne 0) {{ # WAIT_OBJECT_0 is 0
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        [Launcher]::TerminateJobObject($hJob, 1) | Out-Null
+        throw "WaitForSingleObject failed abnormally: $waitRes (error $err)"
+    }}
     
     [System.Threading.Tasks.Task]::WaitAll($outTask, $errTask)
     
     $exitCode = 0
-    [Launcher]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode) | Out-Null
+    if (-not [Launcher]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode)) {{
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "GetExitCodeProcess failed with error $err"
+    }}
     
     $result = @{{
         ExitCode = $exitCode
@@ -234,13 +318,15 @@ try {{
     $err | ConvertTo-Json -Compress
 }} finally {{
     [Launcher]::CloseHandle($pi.hProcess) | Out-Null
-    [Launcher]::CloseHandle($hJob) | Out-Null
+    if ($hJob -ne [IntPtr]::Zero) {{
+        [Launcher]::CloseHandle($hJob) | Out-Null
+    }}
 }}
 '''
     with open("temp_test.ps1", "w") as f:
         f.write(script)
         
-    res = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", "temp_test.ps1", "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", os.path.abspath(".")], capture_output=True, text=True, timeout=timeout+10)
+    res = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-File", "temp_test.ps1", "-TargetCmd", cmd[0], "-TargetArgs", args_str, "-TargetCwd", os.path.abspath("."), "-TargetEnvJson", env_json], capture_output=True, text=True, timeout=timeout+10)
     os.remove("temp_test.ps1")
     try:
         return json.loads(res.stdout.strip())
@@ -328,32 +414,88 @@ time.sleep(20)
     os.remove("pids.txt")
 
 def test_containment_race_condition():
-    # To prove the race condition, we simulate a delay between process start and job assignment in the old approach,
-    # and compare it with the new CREATE_SUSPENDED approach.
-    
     import time
     import psutil
     
+    # Control process to ensure we don't just kill everything
+    control_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    control_pid = control_proc.pid
+
     script = f"""import subprocess, os, sys, time
-# Immediately spawn a breakaway child that lives forever
-gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
-print(gc.pid)
-sys.stdout.flush()
+# Immediately spawn a breakaway child
+c = subprocess.Popen([sys.executable, '-c', '''import subprocess, os, time, sys
+gc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+with open("race_pids.txt", "a") as f:
+    f.write(str(os.getpid()) + "," + str(gc.pid) + chr(10))
+    f.flush()
+time.sleep(30)
+'''])
+with open("race_pids.txt", "a") as f:
+    f.write(str(os.getpid()) + chr(10))
+    f.flush()
 time.sleep(30)
 """
     with open("race_child.py", "w") as f:
         f.write(script)
+    if os.path.exists("race_pids.txt"):
+        os.remove("race_pids.txt")
         
-    # We can prove the NEW approach by seeing if the grandchild survives a timeout.
-    # If the process was created suspended, it couldn't spawn the grandchild before assignment.
-    # When timeout occurs, the Job Object terminates everything.
-    res = run_ps1_wrapper([sys.executable, "race_child.py"], timeout=1)
+    res = run_ps1_wrapper([sys.executable, "race_child.py"], timeout=3)
     
     assert res["TimedOut"] is True
     
-    # If there was a race, the grandchild might survive. But because of CREATE_SUSPENDED,
-    # the grandchild is born INTO the Job Object, and thus dies with it.
-    # The grandchild's PID isn't available to python easily because it died before the script finished.
-    # We can check there are no lingering python processes born from race_child.py
+    # Read the PIDs
+    assert os.path.exists("race_pids.txt")
+    with open("race_pids.txt", "r") as f:
+        lines = f.read().strip().split('\n')
     
+    # We should have root PID on one line, and child,grandchild on another line.
+    root_pid = None
+    child_pid = None
+    grandchild_pid = None
+    for line in lines:
+        parts = line.split(',')
+        if len(parts) == 1:
+            root_pid = int(parts[0])
+        elif len(parts) == 2:
+            child_pid = int(parts[0])
+            grandchild_pid = int(parts[1])
+            
+    assert root_pid is not None
+    assert child_pid is not None
+    assert grandchild_pid is not None
+    
+    # Verify they are all dead!
+    assert not psutil.pid_exists(root_pid)
+    assert not psutil.pid_exists(child_pid)
+    assert not psutil.pid_exists(grandchild_pid)
+    
+    # Verify control is alive
+    assert psutil.pid_exists(control_pid)
+    
+    control_proc.kill()
     os.remove("race_child.py")
+    os.remove("race_pids.txt")
+    
+def test_creation_flags():
+    # 0x08000404 is the expected value of CREATE_UNICODE_ENVIRONMENT (0x400) | CREATE_SUSPENDED (0x4) | CREATE_NO_WINDOW (0x08000000)
+    assert 0x0400 | 0x04 | 0x08000000 == 0x08000404
+
+import pytest
+@pytest.mark.skipif(not os.environ.get("AGY_RUNNER_PWD"), reason="AGY_RUNNER_PWD not set")
+def test_cross_account_runner():
+    from agy_worker import run_as_runner
+    
+    script = f"""import sys
+print('hello from runner')
+sys.stdout.flush()
+"""
+    with open("runner_child.py", "w") as f:
+        f.write(script)
+        
+    res = run_as_runner([sys.executable, "runner_child.py"], timeout=5, cwd=os.path.abspath("."), env={"TEST_ENV": "1"})
+    
+    assert res["ExitCode"] == 0
+    assert "hello from runner" in res["Stdout"]
+    
+    os.remove("runner_child.py")

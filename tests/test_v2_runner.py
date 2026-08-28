@@ -23,7 +23,7 @@ def test_runner_schema_success(monkeypatch):
     with open(pwd_path, "w") as f: f.write("dummy")
     monkeypatch.setattr("agy_worker.RUNNER_PWD_PATH", pwd_path)
     
-    res = run_as_runner(["dummy"], ".")
+    res = run_as_runner(["dummy"], timeout=5, cwd=".")
     assert res["exit_code"] == 0
     assert res["stdout"] == "success output"
     assert res["stderr"] == "some stderr"
@@ -47,7 +47,7 @@ def test_runner_schema_child_exit_1(monkeypatch):
     with open(pwd_path, "w") as f: f.write("dummy")
     monkeypatch.setattr("agy_worker.RUNNER_PWD_PATH", pwd_path)
     
-    res = run_as_runner(["dummy"], ".")
+    res = run_as_runner(["dummy"], timeout=5, cwd=".")
     assert res["exit_code"] == 1
     assert res["stderr"] == "error output"
     assert res["spawn_error"] == ""
@@ -70,6 +70,6 @@ def test_runner_schema_spawn_failure(monkeypatch):
     with open(pwd_path, "w") as f: f.write("dummy")
     monkeypatch.setattr("agy_worker.RUNNER_PWD_PATH", pwd_path)
     
-    res = run_as_runner(["dummy"], ".")
+    res = run_as_runner(["dummy"], timeout=5, cwd=".")
     assert res["exit_code"] == -1
     assert res["spawn_error"] == "Cannot find file"
