@@ -5,3 +5,4 @@ agy_verification_audit.jsonl
 .venv
 venv/
 build/
+.agentwitness/
