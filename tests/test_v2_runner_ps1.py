@@ -512,3 +512,64 @@ sys.stdout.flush()
     assert "hello from runner" in res["stdout"]
     
     os.remove("runner_child.py")
+
+@pytest.mark.skipif(not os.environ.get("AGY_RUNNER_PWD"), reason="AGY_RUNNER_PWD not set")
+def test_cross_account_runner_environment_exclusion(monkeypatch):
+    from agy_worker import run_as_runner
+    
+    script = '''import os, sys, json
+env_dump = dict(os.environ)
+print(json.dumps(env_dump))
+sys.stdout.flush()
+'''
+    with open("runner_env_child.py", "w") as f:
+        f.write(script)
+        
+    # We set a sentinel in the trusted wrapper environment (this Python process)
+    # to simulate the Worker's environment containing AGY_RUNNER_PWD
+    # Wait, the worker reads AGY_RUNNER_PWD from file.
+    # To simulate it, we can just let run_as_runner run. It will read the real AGY_RUNNER_PWD
+    # and put it into wrapper_env.
+    
+    res = run_as_runner([sys.executable, "runner_env_child.py"], timeout=5, cwd=os.path.abspath("."), env={"SAFE_VAR": "HELLO_WORLD"})
+    
+    assert res["exit_code"] == 0
+    import json
+    child_env = json.loads(res["stdout"])
+    
+    # Prove the allowlist works
+    assert child_env.get("SAFE_VAR") == "HELLO_WORLD"
+    
+    # Prove AGY_RUNNER_PWD is absent!
+    assert "AGY_RUNNER_PWD" not in child_env
+    
+    os.remove("runner_env_child.py")
+
+
+def test_environment_exclusion_mechanics(monkeypatch):
+    import sys, os, json
+    
+    script = '''import os, sys, json
+env_dump = dict(os.environ)
+print(json.dumps(env_dump))
+sys.stdout.flush()
+'''
+    with open("env_mechanics.py", "w") as f:
+        f.write(script)
+        
+    # Inject AGY_RUNNER_PWD into the trusted Python process (which is inherited by the PowerShell wrapper)
+    monkeypatch.setenv("AGY_RUNNER_PWD", "test_sentinel_pwd")
+    
+    # We pass an explicit allowlist in the child's environment (which PowerShell will use to build envPtr)
+    res = run_ps1_wrapper([sys.executable, "env_mechanics.py"], timeout=5, env={"SAFE_VAR": "hello_world_123"})
+    
+    assert res["exit_code"] == 0
+    child_env = json.loads(res["stdout"])
+    
+    # Prove the allowlist works
+    assert child_env.get("SAFE_VAR") == "hello_world_123"
+    
+    # Prove AGY_RUNNER_PWD is absent from the untrusted child!
+    assert "AGY_RUNNER_PWD" not in child_env
+    
+    os.remove("env_mechanics.py")

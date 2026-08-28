@@ -69,7 +69,7 @@ def sanitize_diagnostic(text: str) -> str:
         
     return text[:1000]
 
-def run_as_runner(cmd: list[str], timeout: int, cwd: str, env: dict = None) -> dict:
+def run_as_runner(cmd: list[str], *, timeout: int, cwd: str, env: dict = None) -> dict:
     import json
     import os
     import subprocess
@@ -540,7 +540,7 @@ def execute(req: ExecuteRequest):
             evidence["repo_path"] = repo
             
             def run_git(args, key):
-                res = run_as_runner(["git"] + args, repo)
+                res = run_as_runner(["git"] + args, timeout=60, cwd=repo)
                 evidence[key] = {
                     "exit_code": res["exit_code"],
                     "stdout_snippet": sanitize_diagnostic(res["stdout"]),
@@ -610,7 +610,7 @@ def execute(req: ExecuteRequest):
                 safe_env["PYTHONPATH"] = os.path.join(repo_path, "src")
                 
             timeout = 300 if req.profile == "python-full" else 120
-            res = run_as_runner(cmd, timeout=timeout, cwd=repo_path, env=safe_env)
+            res = run_as_runner(cmd=cmd, timeout=timeout, cwd=repo_path, env=safe_env)
             
             fp_after, fp_count_after = _workspace_fingerprint(repo_path)
             
