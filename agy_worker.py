@@ -540,7 +540,15 @@ def execute(req: ExecuteRequest):
             evidence["repo_path"] = repo
             
             def run_git(args, key):
-                res = run_as_runner(["git"] + args, timeout=60, cwd=repo)
+                safe_env = {
+                    "SystemRoot": os.environ.get("SystemRoot", "C:\\Windows"),
+                    "WINDIR": os.environ.get("WINDIR", "C:\\Windows"),
+                    "SystemDrive": os.environ.get("SystemDrive", "C:"),
+                    "PATH": os.environ.get("PATH", ""),
+                    "TEMP": "C:\\Windows\\Temp",
+                    "TMP": "C:\\Windows\\Temp",
+                }
+                res = run_as_runner(["git"] + args, timeout=60, cwd=repo, env=safe_env)
                 evidence[key] = {
                     "exit_code": res["exit_code"],
                     "stdout_snippet": sanitize_diagnostic(res["stdout"]),

@@ -15,6 +15,12 @@ def test_worker_execute_pushed():
     
     def mock_run(cmd, *, timeout, cwd, env=None):
         executed_cmds.append(cmd)
+        
+        # REGRESSION TEST: Ensure safe_env is provided to prevent STATUS_DLL_INIT_FAILED (exit_code: -1073741502)
+        assert env is not None, "env must not be None"
+        assert "SystemRoot" in env, "SystemRoot is required in safe_env"
+        assert "PATH" in env, "PATH is required in safe_env"
+        
         if "rev-parse" in cmd and "--abbrev-ref" in cmd:
             return {"exit_code": 0, "stdout": "main\n", "stderr": "", "spawn_error": "", "timed_out": False}
         return {"exit_code": 0, "stdout": "mock output\n", "stderr": "", "spawn_error": "", "timed_out": False}
@@ -51,6 +57,11 @@ def test_worker_execute_pushed_git_fails():
     from unittest.mock import patch
     
     def mock_run(cmd, *, timeout, cwd, env=None):
+        # REGRESSION TEST: Ensure safe_env is provided to prevent STATUS_DLL_INIT_FAILED (exit_code: -1073741502)
+        assert env is not None, "env must not be None"
+        assert "SystemRoot" in env, "SystemRoot is required in safe_env"
+        assert "PATH" in env, "PATH is required in safe_env"
+        
         if "status" in cmd:
             return {"exit_code": 128, "stdout": "", "stderr": "fatal: not a git repository", "spawn_error": "", "timed_out": False}
         return {"exit_code": 0, "stdout": "", "stderr": "", "spawn_error": "", "timed_out": False}
