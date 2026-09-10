@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import requests
 import hashlib
@@ -17,6 +18,29 @@ WORKER_PORT = 8124
 PROTECTED_DIR = "C:/ProgramData/AGYVerifier"
 SECRET_PATH = os.path.join(PROTECTED_DIR, "worker_secret.key")
 RUNNER_PWD_PATH = os.path.join(PROTECTED_DIR, "runner_pwd.txt")
+
+# CreateProcessWithLogonW (used by run_as_runner to launch as the AGYRunner
+# account) resolves a bare executable name using the *calling* process's own
+# PATH, not the "env" dict handed to it for the child process. The
+# AGYWorker service account that runs agy_worker.exe does not reliably have
+# Git on its own PATH, so passing plain "git" fails with Win32 error 2
+# (file not found) even though safe_env["PATH"] looks correct. Resolve a
+# concrete git.exe path once at import time instead.
+#
+# "Git\cmd\git.exe" (found first by shutil.which/PATH order) is only a small
+# ~43KB launcher stub that relocates itself onto the real ~4MB binary at
+# "Git\mingw64\bin\git.exe". That relocation crashed with
+# STATUS_DLL_INIT_FAILED specifically when launched via
+# CreateProcessWithLogonW as the disposable AGYRunner account from the
+# AGYWorker service session (confirmed live: adding the AGYRunner profile's
+# usual environment variables and an explicit winsta0\Default desktop did
+# NOT fix it), so call the real mingw64 binary directly instead of the shim.
+_GIT_CMD_SHIM = shutil.which("git")
+if _GIT_CMD_SHIM:
+    _mingw_candidate = os.path.join(os.path.dirname(os.path.dirname(_GIT_CMD_SHIM)), "mingw64", "bin", "git.exe")
+    GIT_EXE = _mingw_candidate if os.path.exists(_mingw_candidate) else _GIT_CMD_SHIM
+else:
+    GIT_EXE = "C:\\Program Files\\Git\\mingw64\\bin\\git.exe"
 
 app = FastAPI(title="Antigravity Trusted Broker")
 
@@ -294,6 +318,12 @@ $si.dwFlags = 0x00000100 # STARTF_USESTDHANDLES
 $si.hStdInput = $hInRead
 $si.hStdOutput = $hOutWrite
 $si.hStdError = $hErrWrite
+# When this wrapper itself runs under a non-interactive service account
+# (e.g. AGYWorker in Session 0), a new logon session started via
+# CreateProcessWithLogonW has no window station/desktop association unless
+# one is named explicitly. Some Win32/CRT process-init paths fail with
+# STATUS_DLL_INIT_FAILED in that case even for console-subsystem targets.
+$si.lpDesktop = "winsta0\\Default"
 
 $pi = New-Object Launcher+PROCESS_INFORMATION
 $cmdLine = "`"$TargetCmd`" $TargetArgs"
@@ -540,6 +570,17 @@ def execute(req: ExecuteRequest):
             evidence["repo_path"] = repo
             
             def run_git(args, key):
+                # NOTE (fixed 2026-09-10): a git.exe launched via CreateProcessWithLogonW
+                # with LOGON_WITH_PROFILE and a non-null (but partial) environment block
+                # does NOT get the AGYRunner profile's own environment merged in -- an
+                # explicit env block replaces it entirely. The original 6-key safe_env
+                # above was sufficient to stop STATUS_DLL_INIT_FAILED in some contexts
+                # but still crashed with the same error when launched from the
+                # AGYWorker service task, because Git for Windows' shim (git.exe ->
+                # mingw64 git) also needs a user-profile-shaped environment
+                # (USERPROFILE/APPDATA/ProgramFiles/ComSpec/etc.) to initialize. Add the
+                # remaining standard Windows variables so the child gets a complete,
+                # if minimal, environment instead of a hand-picked subset.
                 safe_env = {
                     "SystemRoot": os.environ.get("SystemRoot", "C:\\Windows"),
                     "WINDIR": os.environ.get("WINDIR", "C:\\Windows"),
@@ -547,8 +588,23 @@ def execute(req: ExecuteRequest):
                     "PATH": os.environ.get("PATH", ""),
                     "TEMP": "C:\\Windows\\Temp",
                     "TMP": "C:\\Windows\\Temp",
+                    "USERPROFILE": os.environ.get("USERPROFILE", "C:\\Windows\\Temp"),
+                    "APPDATA": os.environ.get("APPDATA", "C:\\Windows\\Temp"),
+                    "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", "C:\\Windows\\Temp"),
+                    "ALLUSERSPROFILE": os.environ.get("ALLUSERSPROFILE", "C:\\ProgramData"),
+                    "ProgramData": os.environ.get("ProgramData", "C:\\ProgramData"),
+                    "ProgramFiles": os.environ.get("ProgramFiles", "C:\\Program Files"),
+                    "ProgramFiles(x86)": os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+                    "ProgramW6432": os.environ.get("ProgramW6432", "C:\\Program Files"),
+                    "ComSpec": os.environ.get("ComSpec", "C:\\Windows\\System32\\cmd.exe"),
+                    "HOMEDRIVE": os.environ.get("HOMEDRIVE", "C:"),
+                    "HOMEPATH": os.environ.get("HOMEPATH", "\\Windows\\Temp"),
+                    "PSModulePath": os.environ.get("PSModulePath", ""),
+                    "NUMBER_OF_PROCESSORS": os.environ.get("NUMBER_OF_PROCESSORS", "1"),
+                    "PROCESSOR_ARCHITECTURE": os.environ.get("PROCESSOR_ARCHITECTURE", "AMD64"),
+                    "OS": os.environ.get("OS", "Windows_NT"),
                 }
-                res = run_as_runner(["git"] + args, timeout=60, cwd=repo, env=safe_env)
+                res = run_as_runner([GIT_EXE] + args, timeout=60, cwd=repo, env=safe_env)
                 evidence[key] = {
                     "exit_code": res["exit_code"],
                     "stdout_snippet": sanitize_diagnostic(res["stdout"]),

@@ -36,10 +36,16 @@ def test_worker_execute_pushed():
         assert "evidence" in data
         evidence = data["evidence"]
         
-        assert any(cmd[:3] == ["git", "remote", "get-url"] for cmd in executed_cmds)
-        assert any(cmd[:3] == ["git", "status", "--porcelain"] for cmd in executed_cmds)
-        assert any(cmd[:4] == ["git", "rev-parse", "--abbrev-ref", "HEAD"] for cmd in executed_cmds)
-        assert any(cmd[:3] == ["git", "ls-remote", "origin"] for cmd in executed_cmds)
+        # REGRESSION TEST: git must be invoked by a resolved absolute path
+        # (agy_worker.GIT_EXE), not the bare string "git". CreateProcessWithLogonW
+        # resolves the executable using the *caller's* own PATH, not the env
+        # dict handed to the child, so a bare "git" fails with Win32 error 2
+        # (file not found) under service accounts that lack Git on PATH.
+        git = agy_worker.GIT_EXE
+        assert any(cmd[:3] == [git, "remote", "get-url"] for cmd in executed_cmds)
+        assert any(cmd[:3] == [git, "status", "--porcelain"] for cmd in executed_cmds)
+        assert any(cmd[:4] == [git, "rev-parse", "--abbrev-ref", "HEAD"] for cmd in executed_cmds)
+        assert any(cmd[:3] == [git, "ls-remote", "origin"] for cmd in executed_cmds)
         
         assert "git_remote_url" in evidence
         assert "git_status" in evidence
